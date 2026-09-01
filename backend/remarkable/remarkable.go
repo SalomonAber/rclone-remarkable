@@ -33,6 +33,11 @@ func init() {
 			Name: "host",
 			Help: "rmfakecloud or reMarkable API base URL. Defaults to RMAPI_HOST or http://127.0.0.1:7632.",
 		}, {
+			Name:     "refresh_interval",
+			Help:     "Interval between rmapi metadata refreshes while listing.",
+			Default:  fs.Duration(30 * time.Second),
+			Advanced: true,
+		}, {
 			Name:     "config",
 			Help:     "Path to an rmapi YAML config containing devicetoken and usertoken.",
 			Advanced: true,
@@ -52,10 +57,11 @@ func init() {
 
 // Options configures the rmapi library client.
 type Options struct {
-	Host        string `config:"host"`
-	Config      string `config:"config"`
-	DeviceToken string `config:"device_token"`
-	UserToken   string `config:"user_token"`
+	Host            string      `config:"host"`
+	RefreshInterval fs.Duration `config:"refresh_interval"`
+	Config          string      `config:"config"`
+	DeviceToken     string      `config:"device_token"`
+	UserToken       string      `config:"user_token"`
 }
 
 // Fs represents a remarkable document tree.
@@ -253,7 +259,13 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	if err != nil {
 		return nil, err
 	}
-	return &Object{fs: f, remote: remote, item: item, size: srcObject.size}, nil
+	size := srcObject.size
+	if info, promoted, err := f.cache.promoteMetadata(srcObject.item, item); err != nil {
+		fs.Errorf(srcObject, "Failed to promote cached metadata: %v", err)
+	} else if promoted {
+		size = info.Size()
+	}
+	return &Object{fs: f, remote: remote, item: item, size: size}, nil
 }
 
 // DirMove moves a collection by mutating its parent/name metadata once.

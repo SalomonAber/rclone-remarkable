@@ -1,10 +1,15 @@
 package remarkable
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"testing"
 
+	rmarchive "github.com/juruen/rmapi/archive"
 	"github.com/rclone/rclone/fs"
 )
 
@@ -49,8 +54,52 @@ func TestFileMetadataMovesPreserveUUID(t *testing.T) {
 			if got := client.downloadCount("abc123"); got != beforeDownloads {
 				t.Fatalf("rename/move downloaded content: before=%d after=%d", beforeDownloads, got)
 			}
+			reader, err := dst.Open(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			content, err := io.ReadAll(reader)
+			if closeErr := reader.Close(); err == nil {
+				err = closeErr
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			metadata := rmdocMetadata(t, content, "abc123")
+			if metadata.DocName != test.wantName || metadata.Parent != test.wantParent {
+				t.Fatalf("promoted metadata = %#v", metadata)
+			}
+			if got := client.downloadCount("abc123"); got != beforeDownloads {
+				t.Fatalf("opening moved object downloaded content: before=%d after=%d", beforeDownloads, got)
+			}
 		})
 	}
+}
+
+func rmdocMetadata(t *testing.T, content []byte, id string) rmarchive.MetadataFile {
+	t.Helper()
+	archive, err := zip.NewReader(bytes.NewReader(content), int64(len(content)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range archive.File {
+		if entry.Name != id+".metadata" {
+			continue
+		}
+		reader, err := entry.Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var metadata rmarchive.MetadataFile
+		err = json.NewDecoder(reader).Decode(&metadata)
+		_ = reader.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return metadata
+	}
+	t.Fatalf("metadata entry for %q not found", id)
+	return rmarchive.MetadataFile{}
 }
 
 func TestMutationFeaturesAdvertised(t *testing.T) {

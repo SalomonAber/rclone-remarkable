@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -242,6 +243,27 @@ func TestConcurrentOpensDeduplicateMaterialization(t *testing.T) {
 	}
 	if calls := client.downloadCount("doc"); calls != 1 {
 		t.Fatalf("concurrent downloads = %d, want 1", calls)
+	}
+}
+
+func TestCanceledMaterializationRemovesPartialFiles(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	cacheDir := t.TempDir()
+	client := &fakeClient{
+		contents:        map[string][]byte{"doc": []byte("partial")},
+		releaseDownload: make(chan struct{}),
+	}
+	cache := newContentCache(cacheDir, client)
+	if _, _, err := cache.materialize(ctx, Item{ID: "doc", Version: 1}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("materialize error = %v", err)
+	}
+	entries, err := os.ReadDir(filepath.Join(cacheDir, "doc"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("partial cache files remain: %v", entries)
 	}
 }
 

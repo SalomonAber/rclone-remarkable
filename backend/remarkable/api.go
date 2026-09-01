@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	rmapi "github.com/juruen/rmapi/api"
@@ -44,11 +45,14 @@ type Client interface {
 }
 
 type rmapiClient struct {
-	api rmapi.ApiCtx
+	mu              sync.Mutex
+	api             rmapi.ApiCtx
+	refreshInterval time.Duration
+	lastRefresh     time.Time
 }
 
-func newRMAPIClient(api rmapi.ApiCtx) Client {
-	return &rmapiClient{api: api}
+func newRMAPIClient(api rmapi.ApiCtx, refreshInterval time.Duration) Client {
+	return &rmapiClient{api: api, refreshInterval: refreshInterval, lastRefresh: time.Now()}
 }
 
 func newConfiguredRMAPIClient(opt Options) (Client, error) {
@@ -66,7 +70,11 @@ func newConfiguredRMAPIClient(opt Options) (Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("remarkable: initialize rmapi sync client: %w", err)
 	}
-	return newRMAPIClient(apiCtx), nil
+	refreshInterval := time.Duration(opt.RefreshInterval)
+	if refreshInterval <= 0 {
+		refreshInterval = 30 * time.Second
+	}
+	return newRMAPIClient(apiCtx, refreshInterval), nil
 }
 
 func rmapiTokens(opt Options) (model.AuthTokens, error) {
@@ -111,6 +119,14 @@ func configureRMAPIHost(host string) {
 }
 
 func (c *rmapiClient) List(_ context.Context, parentID string) ([]Item, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if time.Since(c.lastRefresh) >= c.refreshInterval {
+		if _, _, err := c.api.Refresh(); err != nil {
+			return nil, fmt.Errorf("rmapi: refresh file tree: %w", err)
+		}
+		c.lastRefresh = time.Now()
+	}
 	parent := c.api.Filetree().NodeById(parentID)
 	if parent == nil || !parent.IsDirectory() {
 		return nil, fmt.Errorf("rmapi: parent %q is not a directory", parentID)
@@ -128,6 +144,8 @@ func (c *rmapiClient) List(_ context.Context, parentID string) ([]Item, error) {
 }
 
 func (c *rmapiClient) Get(_ context.Context, id string) (Item, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	node := c.api.Filetree().NodeById(id)
 	if node == nil {
 		return Item{}, fmt.Errorf("rmapi: item %q not found", id)
@@ -136,6 +154,8 @@ func (c *rmapiClient) Get(_ context.Context, id string) (Item, error) {
 }
 
 func (c *rmapiClient) Download(_ context.Context, id string, dst io.Writer) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	tmp, err := os.CreateTemp("", "rclone-remarkable-*.rmdoc")
 	if err != nil {
 		return err
@@ -159,6 +179,8 @@ func (c *rmapiClient) Download(_ context.Context, id string, dst io.Writer) erro
 }
 
 func (c *rmapiClient) Move(_ context.Context, id, parentID, name string) (Item, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	src := c.api.Filetree().NodeById(id)
 	dst := c.api.Filetree().NodeById(parentID)
 	if src == nil || dst == nil {
@@ -173,6 +195,8 @@ func (c *rmapiClient) Move(_ context.Context, id, parentID, name string) (Item, 
 }
 
 func (c *rmapiClient) Mkdir(_ context.Context, parentID, name string) (Item, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	doc, err := c.api.CreateDir(parentID, name, true)
 	if err != nil {
 		return Item{}, err
@@ -182,6 +206,8 @@ func (c *rmapiClient) Mkdir(_ context.Context, parentID, name string) (Item, err
 }
 
 func (c *rmapiClient) Remove(_ context.Context, id string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	node := c.api.Filetree().NodeById(id)
 	if node == nil {
 		return fmt.Errorf("rmapi: item %q not found", id)

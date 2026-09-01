@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/rclone/rclone/fs"
 )
 
 func TestRMFakecloudIntegration(t *testing.T) {
@@ -31,10 +33,11 @@ func TestRMFakecloudIntegration(t *testing.T) {
 
 	ctx := context.Background()
 	client, err := newConfiguredRMAPIClient(Options{
-		Host:        host,
-		Config:      configPath,
-		DeviceToken: os.Getenv("REMARKABLE_DEVICE_TOKEN"),
-		UserToken:   os.Getenv("REMARKABLE_USER_TOKEN"),
+		Host:            host,
+		RefreshInterval: fs.Duration(time.Second),
+		Config:          configPath,
+		DeviceToken:     os.Getenv("REMARKABLE_DEVICE_TOKEN"),
+		UserToken:       os.Getenv("REMARKABLE_USER_TOKEN"),
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -103,6 +103,28 @@ go test ./backend/remarkable -run TestRMFakecloudIntegration -count=1
 
 Set `REMARKABLE_HOST` to override the integration endpoint and `REMARKABLE_USER_TOKEN`/`REMARKABLE_DEVICE_TOKEN` to supply credentials without a YAML file.
 
+## Mount
+
+The following configuration was tested against rmfakecloud with `ls`, `stat`, repeated and concurrent reads, copy-out, same-directory and cross-directory `mv`, `mkdir`, non-empty and empty `rmdir`, and `rm`:
+
+```sh
+RCLONE_REMARKABLE_REFRESH_INTERVAL=30s \
+./rclone mount \
+	:remarkable,host=http://127.0.0.1:7632: \
+	/tmp/remarkable \
+	--vfs-cache-mode full \
+	--cache-dir /tmp/rclone-remarkable-cache \
+	--dir-cache-time 30s \
+	--poll-interval 0 \
+	--attr-timeout 1s
+```
+
+Use an absolute persistent `--cache-dir` for normal operation. `full` mode gives editors and other POSIX applications stable local seek/read behavior. Polling is disabled because this backend does not implement rclone's change-notify interface; instead, `refresh_interval` bounds rmapi metadata refreshes during listings. Keep `--dir-cache-time` near that interval. Successful mutations update rmapi's in-process tree immediately, so they do not wait for either interval.
+
+The backend content cache remains keyed by UUID and remote version beneath `<cache-dir>/remarkable`. Metadata-only file moves atomically derive the new version from the cached `.rmdoc` and rewrite its embedded metadata, avoiding a remote content download. The VFS cache is a separate rclone-managed layer. Testing confirmed repeated stats, copy-out, and eight concurrent opens reused one VFS entry; unmount left valid ZIP archives and no `.materializing-*` or `.promoting-*` files.
+
+Arbitrary file creation and writes through the mount remain unsupported because `Put`/`Update` are intentionally not implemented. Directory creation and metadata-only rename, move, and removal are supported.
+
 ## Compatibility Notes
 
 - rmapi's endpoint URLs are package-global values. The backend sets them from `host` before constructing its client, so different `remarkable` hosts are not safe to use simultaneously in one rclone process.
