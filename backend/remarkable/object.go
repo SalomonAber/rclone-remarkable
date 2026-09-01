@@ -70,6 +70,8 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 func (o *Object) Update(context.Context, io.Reader, fs.ObjectInfo, ...fs.OpenOption) error {
 	return fs.ErrorNotImplemented
 }
-func (o *Object) Remove(context.Context) error { return fs.ErrorNotImplemented }
+func (o *Object) Remove(ctx context.Context) error {
+	return o.fs.client.Remove(ctx, o.item.ID)
+}
 
 var _ fs.Object = (*Object)(nil)

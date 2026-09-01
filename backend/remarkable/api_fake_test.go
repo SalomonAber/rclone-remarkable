@@ -17,11 +17,28 @@ type fakeClient struct {
 	items           map[string]Item
 	contents        map[string][]byte
 	downloads       map[string]int
+	moves           []moveCall
+	mkdirs          []mkdirCall
+	removes         []string
+	nextID          int
 	downloadStarted chan struct{}
 	releaseDownload chan struct{}
 }
 
+type moveCall struct {
+	ID       string
+	ParentID string
+	Name     string
+}
+
+type mkdirCall struct {
+	ParentID string
+	Name     string
+}
+
 func (c *fakeClient) List(_ context.Context, parentID string) ([]Item, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	var items []Item
 	for _, item := range c.items {
 		if item.ParentID == parentID {
@@ -32,6 +49,8 @@ func (c *fakeClient) List(_ context.Context, parentID string) ([]Item, error) {
 }
 
 func (c *fakeClient) Get(_ context.Context, id string) (Item, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	item, ok := c.items[id]
 	if !ok {
 		return Item{}, fmt.Errorf("item %q not found", id)
@@ -68,18 +87,59 @@ func (c *fakeClient) Download(ctx context.Context, id string, dst io.Writer) err
 	_, err := dst.Write(content)
 	return err
 }
-func (c *fakeClient) Move(context.Context, string, string, string) (Item, error) {
-	return Item{}, nil
+func (c *fakeClient) Move(_ context.Context, id, parentID, name string) (Item, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	item, ok := c.items[id]
+	if !ok {
+		return Item{}, fmt.Errorf("item %q not found", id)
+	}
+	c.moves = append(c.moves, moveCall{ID: id, ParentID: parentID, Name: name})
+	item.ParentID = parentID
+	item.Name = name
+	item.Version++
+	item.ModTime = time.Now().UTC()
+	c.items[id] = item
+	return item, nil
 }
-func (c *fakeClient) Mkdir(context.Context, string, string) (Item, error) {
-	return Item{}, nil
+func (c *fakeClient) Mkdir(_ context.Context, parentID, name string) (Item, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.nextID++
+	item := Item{
+		ID:       fmt.Sprintf("created-%d", c.nextID),
+		Name:     name,
+		ParentID: parentID,
+		Kind:     ItemDirectory,
+	}
+	c.mkdirs = append(c.mkdirs, mkdirCall{ParentID: parentID, Name: name})
+	if c.items == nil {
+		c.items = make(map[string]Item)
+	}
+	c.items[item.ID] = item
+	return item, nil
 }
-func (c *fakeClient) Remove(context.Context, string) error { return nil }
+func (c *fakeClient) Remove(_ context.Context, id string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.items[id]; !ok {
+		return fmt.Errorf("item %q not found", id)
+	}
+	c.removes = append(c.removes, id)
+	delete(c.items, id)
+	return nil
+}
 
 func (c *fakeClient) downloadCount(id string) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.downloads[id]
+}
+
+func (c *fakeClient) operations() ([]moveCall, []mkdirCall, []string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]moveCall(nil), c.moves...), append([]mkdirCall(nil), c.mkdirs...), append([]string(nil), c.removes...)
 }
 
 var _ Client = (*fakeClient)(nil)

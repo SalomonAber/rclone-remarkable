@@ -18,16 +18,17 @@ import (
 )
 
 var errClientUnavailable = errors.New("remarkable client is not configured")
+var errDestinationExists = errors.New("destination already exists")
 
 func init() {
 	fs.Register(&fs.RegInfo{
 		Name:        "remarkable",
-		Description: "Read-only reMarkable document tree via rmapi",
+		Description: "reMarkable document tree via rmapi",
 		NewFs:       NewFs,
 	})
 }
 
-// Fs represents a read-only remarkable document tree.
+// Fs represents a remarkable document tree.
 type Fs struct {
 	name     string
 	root     string
@@ -115,11 +116,14 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 		return nil, errClientUnavailable
 	}
 	item, err := f.resolve(ctx, f.rootID, remote)
-	if errors.Is(err, fs.ErrorObjectNotFound) || item.Kind != ItemDocument {
+	if errors.Is(err, fs.ErrorObjectNotFound) {
 		return nil, fs.ErrorObjectNotFound
 	}
 	if err != nil {
 		return nil, err
+	}
+	if item.Kind != ItemDocument {
+		return nil, fs.ErrorObjectNotFound
 	}
 	return f.newObject(ctx, remote, item)
 }
@@ -128,8 +132,101 @@ func (f *Fs) Put(context.Context, io.Reader, fs.ObjectInfo, ...fs.OpenOption) (f
 	return nil, fs.ErrorNotImplemented
 }
 
-func (f *Fs) Mkdir(context.Context, string) error { return fs.ErrorNotImplemented }
-func (f *Fs) Rmdir(context.Context, string) error { return fs.ErrorNotImplemented }
+func (f *Fs) Mkdir(ctx context.Context, dir string) error {
+	if f.client == nil {
+		return errClientUnavailable
+	}
+	if dir == "" {
+		return nil
+	}
+	parentID, name, err := f.destination(ctx, dir, ItemDirectory, "")
+	if errors.Is(err, errDestinationExists) {
+		item, resolveErr := f.resolve(ctx, f.rootID, dir)
+		if resolveErr == nil && item.Kind == ItemDirectory {
+			return nil
+		}
+		return err
+	}
+	if err != nil {
+		return err
+	}
+	_, err = f.client.Mkdir(ctx, parentID, name)
+	return err
+}
+
+func (f *Fs) Rmdir(ctx context.Context, dir string) error {
+	if f.client == nil {
+		return errClientUnavailable
+	}
+	if dir == "" {
+		return fs.ErrorPermissionDenied
+	}
+	item, err := f.resolve(ctx, f.rootID, dir)
+	if errors.Is(err, fs.ErrorObjectNotFound) {
+		return fs.ErrorDirNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if item.Kind != ItemDirectory {
+		return fs.ErrorDirNotFound
+	}
+	children, err := f.client.List(ctx, item.ID)
+	if err != nil {
+		return err
+	}
+	if len(children) != 0 {
+		return fs.ErrorDirectoryNotEmpty
+	}
+	return f.client.Remove(ctx, item.ID)
+}
+
+// Move renames or moves an object by mutating metadata on its existing UUID.
+func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	srcObject, ok := src.(*Object)
+	if !ok || srcObject.fs.Name() != f.Name() {
+		return nil, fs.ErrorCantMove
+	}
+	parentID, name, err := f.destination(ctx, remote, ItemDocument, srcObject.item.ID)
+	if err != nil {
+		return nil, err
+	}
+	item, err := f.client.Move(ctx, srcObject.item.ID, parentID, name)
+	if err != nil {
+		return nil, err
+	}
+	return &Object{fs: f, remote: remote, item: item, size: srcObject.size}, nil
+}
+
+// DirMove moves a collection by mutating its parent/name metadata once.
+func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string) error {
+	srcFs, ok := src.(*Fs)
+	if !ok || srcFs.Name() != f.Name() {
+		return fs.ErrorCantDirMove
+	}
+	if srcRemote == "" {
+		return fs.ErrorCantDirMove
+	}
+	item, err := srcFs.resolve(ctx, srcFs.rootID, srcRemote)
+	if errors.Is(err, fs.ErrorObjectNotFound) {
+		return fs.ErrorDirNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if item.Kind != ItemDirectory {
+		return fs.ErrorDirNotFound
+	}
+	parentID, name, err := f.destination(ctx, dstRemote, ItemDirectory, item.ID)
+	if errors.Is(err, errDestinationExists) {
+		return fs.ErrorDirExists
+	}
+	if err != nil {
+		return err
+	}
+	_, err = f.client.Move(ctx, item.ID, parentID, name)
+	return err
+}
 
 func (f *Fs) newObject(ctx context.Context, remote string, item Item) (*Object, error) {
 	_, info, err := f.cache.materialize(ctx, item)
@@ -186,4 +283,56 @@ func checkDuplicateNames(items []Item) error {
 	return nil
 }
 
-var _ fs.Fs = (*Fs)(nil)
+func (f *Fs) destination(ctx context.Context, remote string, kind ItemKind, sourceID string) (parentID, name string, err error) {
+	remote = strings.Trim(remote, "/")
+	name = path.Base(remote)
+	parentRemote := path.Dir(remote)
+	if parentRemote == "." {
+		parentRemote = ""
+	}
+	if name == "." || name == "" {
+		return "", "", fmt.Errorf("invalid destination %q", remote)
+	}
+	if kind == ItemDocument {
+		if !strings.HasSuffix(name, ".rmdoc") {
+			return "", "", fmt.Errorf("document destination %q must end in .rmdoc", remote)
+		}
+		name = strings.TrimSuffix(name, ".rmdoc")
+		if name == "" {
+			return "", "", fmt.Errorf("document visible name must not be empty")
+		}
+	}
+	parent, err := f.resolve(ctx, f.rootID, parentRemote)
+	if errors.Is(err, fs.ErrorObjectNotFound) {
+		return "", "", fs.ErrorDirNotFound
+	}
+	if err != nil {
+		return "", "", err
+	}
+	if parent.Kind != ItemDirectory {
+		return "", "", fs.ErrorDirNotFound
+	}
+	items, err := f.client.List(ctx, parent.ID)
+	if err != nil {
+		return "", "", err
+	}
+	if err := checkDuplicateNames(items); err != nil {
+		return "", "", err
+	}
+	wanted := name
+	if kind == ItemDocument {
+		wanted += ".rmdoc"
+	}
+	for _, item := range items {
+		if localName(item) == wanted && item.ID != sourceID {
+			return "", "", fmt.Errorf("%w: %q", errDestinationExists, remote)
+		}
+	}
+	return parent.ID, name, nil
+}
+
+var (
+	_ fs.Fs       = (*Fs)(nil)
+	_ fs.Mover    = (*Fs)(nil)
+	_ fs.DirMover = (*Fs)(nil)
+)

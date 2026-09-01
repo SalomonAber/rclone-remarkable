@@ -1,6 +1,6 @@
 # rclone-remarkable
 
-An out-of-tree rclone backend named `remarkable`. The current read-only model exposes reMarkable collections as directories and documents as raw ZIP-compatible `.rmdoc` objects. Live rmfakecloud client construction is not wired yet; the read model is exercised against the fake client.
+An out-of-tree rclone backend named `remarkable`. The current model exposes reMarkable collections as directories and documents as raw ZIP-compatible `.rmdoc` objects. Metadata mutations are supported, but arbitrary `.rmdoc` writes and live rmfakecloud client construction are not wired yet; behavior is exercised against the fake client.
 
 ## Architecture
 
@@ -13,7 +13,7 @@ Rclone v1.75.0 defines the mandatory contracts in `fs/types.go`:
 - `fs.Mover` optionally adds `Move(context.Context, fs.Object, string) (fs.Object, error)`.
 - `fs.DirMover` optionally adds `DirMove(context.Context, fs.Fs, string, string) error`.
 
-Optional interfaces are detected by `fs.Features.Fill`. Move interfaces are not advertised because the backend remains read-only.
+Optional interfaces are detected by `fs.Features.Fill`. The backend advertises `fs.Mover` and `fs.DirMover`; uploads remain unsupported.
 
 ### Read-only mapping
 
@@ -32,6 +32,20 @@ remarkable/<document UUID>/<remote version>.rmdoc
 ```
 
 Downloads go to a temporary file in the destination directory, are flushed and closed, and are then atomically renamed into place. A process-wide singleflight group keyed by the final cache path ensures simultaneous requests for the same UUID and version share one download. Different versions use different paths; stale versions are retained.
+
+### Metadata mutations
+
+Mutations resolve source entries and destination parents to UUIDs before calling the client. Destination names are checked in the synthesized rclone namespace, so collisions are rejected before any remote call. File destinations must end in `.rmdoc`; that suffix is stripped before changing the reMarkable visible name.
+
+| rclone operation | Client/rmapi operation |
+| --- | --- |
+| `Mkdir` | `Client.Mkdir(parentUUID, visibleName)` / `ApiCtx.CreateDir` |
+| empty `Rmdir` | `Client.Remove(collectionUUID)` / non-recursive `ApiCtx.DeleteEntry` |
+| `Object.Remove` | `Client.Remove(documentUUID)` / non-recursive `ApiCtx.DeleteEntry` |
+| `fs.Mover.Move` | `Client.Move(existingUUID, parentUUID, visibleName)` / `ApiCtx.MoveEntry` |
+| `fs.DirMover.DirMove` | the same single `MoveEntry` call for the existing collection UUID |
+
+The rmapi adapter updates its in-memory file tree immediately after successful create, move, and delete calls. Rename and move never download, delete, recreate, or upload document content. Existing raw cache entries remain available by UUID and version.
 
 ## rmapi findings
 
@@ -52,7 +66,7 @@ The relevant library surface is the sync 1.5 `api.ApiCtx` and its `filetree`/`mo
 | mkdir | `ApiCtx.CreateDir(parentID, name, notify)` |
 | delete | `ApiCtx.DeleteEntry(node, recursive, notify)` removes the entry from the sync tree |
 
-rmapi also creates a synthetic `trash` collection in its file tree. The read-only stage does not choose mutation or trash semantics.
+rmapi also creates a synthetic `trash` collection in its file tree. Deletion uses rmapi's normal non-recursive `DeleteEntry` operation; non-empty directories are rejected with rclone's `ErrorDirectoryNotEmpty` before that call.
 
 `backend/remarkable/api.go` isolates this dependency behind a small `Client` using backend-owned `Item` values. The adapter handles rmapi's path-based `FetchDocument` through a temporary `.rmdoc` file, while callers use an `io.Writer`. Authentication and construction of a live `api.ApiCtx` remain deliberately unwired.
 

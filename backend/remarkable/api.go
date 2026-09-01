@@ -105,6 +105,7 @@ func (c *rmapiClient) Move(_ context.Context, id, parentID, name string) (Item, 
 	if err != nil {
 		return Item{}, err
 	}
+	c.api.Filetree().MoveNode(src, node)
 	return itemFromNode(node)
 }
 
@@ -113,6 +114,7 @@ func (c *rmapiClient) Mkdir(_ context.Context, parentID, name string) (Item, err
 	if err != nil {
 		return Item{}, err
 	}
+	c.api.Filetree().AddDocument(doc)
 	return itemFromDocument(doc)
 }
 
@@ -121,7 +123,11 @@ func (c *rmapiClient) Remove(_ context.Context, id string) error {
 	if node == nil {
 		return fmt.Errorf("rmapi: item %q not found", id)
 	}
-	return c.api.DeleteEntry(node, false, true)
+	if err := c.api.DeleteEntry(node, false, true); err != nil {
+		return err
+	}
+	c.api.Filetree().DeleteNode(node)
+	return nil
 }
 
 func itemFromNode(node *model.Node) (Item, error) {
