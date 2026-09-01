@@ -142,7 +142,7 @@ rmapi normalizes imported archives, so a later downloaded `.rmdoc` is semantical
 
 ## rmapi findings
 
-The maintained `poplicola/rmapi` fork is usable as a Go library. Its module still declares `github.com/juruen/rmapi`, and its packages import that path internally. `go.mod` therefore requires the declared path and replaces it with the maintained fork at commit `2bcde75bf5436626f29497df5390870aa63ea4d0` (2026-04-30).
+The actively maintained `ddvk/rmapi` fork is used as a Go library. Its module still declares `github.com/juruen/rmapi`, and its packages import that path internally. `go.mod` therefore requires the declared path and replaces it with `ddvk/rmapi` at commit `aa60dac8a8dbb1b4eb6a25f2caf2f3daea573373` (2026-08-23). This revision includes the root-index canonical sorting fix required by current sync servers, plus newer sync and document-format fixes.
 
 The relevant library surface is the sync 1.5 `api.ApiCtx` and its `filetree`/`model` packages:
 
