@@ -22,7 +22,10 @@ import (
 // rmapi's concrete API) without any network access, including the tree
 // shape rmapi itself always produces (e.g. its synthetic "trash" collection).
 type fakeAPICtx struct {
-	tree *filetree.FileTreeCtx
+	tree              *filetree.FileTreeCtx
+	refreshHash       string
+	refreshGeneration int64
+	refreshErr        error
 }
 
 func (f *fakeAPICtx) Filetree() *filetree.FileTreeCtx    { return f.tree }
@@ -40,9 +43,35 @@ func (f *fakeAPICtx) MoveEntry(*model.Node, *model.Node, string) (*model.Node, e
 func (f *fakeAPICtx) DeleteEntry(*model.Node, bool, bool) error { return nil }
 func (f *fakeAPICtx) SyncComplete() error                       { return nil }
 func (f *fakeAPICtx) Nuke() error                               { return nil }
-func (f *fakeAPICtx) Refresh() (string, int64, error)           { return "", 0, nil }
+func (f *fakeAPICtx) Refresh() (string, int64, error) {
+	return f.refreshHash, f.refreshGeneration, f.refreshErr
+}
 
 var _ rmapi.ApiCtx = (*fakeAPICtx)(nil)
+
+func TestRMAPIRefreshDetectsSyncRootChanges(t *testing.T) {
+	tree := filetree.CreateFileTreeCtx()
+	api := &fakeAPICtx{tree: &tree, refreshHash: "hash-1", refreshGeneration: 1}
+	client := &rmapiClient{api: api, refreshInterval: time.Hour, lastRefresh: time.Now()}
+
+	changed, err := client.Refresh(context.Background())
+	if err != nil || !changed {
+		t.Fatalf("first refresh = changed %v, error %v; want changed", changed, err)
+	}
+	changed, err = client.Refresh(context.Background())
+	if err != nil || changed {
+		t.Fatalf("unchanged refresh = changed %v, error %v; want unchanged", changed, err)
+	}
+	api.refreshGeneration++
+	changed, err = client.Refresh(context.Background())
+	if err != nil || !changed {
+		t.Fatalf("new generation refresh = changed %v, error %v; want changed", changed, err)
+	}
+	api.refreshErr = fmt.Errorf("refresh failed")
+	if _, err := client.Refresh(context.Background()); err == nil {
+		t.Fatal("refresh error was not returned")
+	}
+}
 
 func TestRMAPIUserTokenRefreshSuccess(t *testing.T) {
 	originalCreate := createRMAPIContext

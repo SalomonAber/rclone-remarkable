@@ -66,7 +66,7 @@ You need a running rmfakecloud instance and an rmapi YAML file containing `devic
 	      "vfs_cache_mode=full"
 	      "vfs_write_back=0s"
 	      "dir_cache_time=30s"
-	      "poll_interval=0"
+	      "poll_interval=30s"
 	      "attr_timeout=1s"
 	    ];
 	  };
@@ -172,6 +172,7 @@ The backend accepts these options:
 | Option | Purpose |
 | --- | --- |
 | `host` | API base URL. Defaults to `RMAPI_HOST`, then `http://127.0.0.1:7632`. |
+| `refresh_interval` | Fallback interval between rmapi metadata refreshes during listings. |
 | `config` | YAML credentials file with `devicetoken` and `usertoken`. Defaults to `RMAPI_CONFIG`. |
 | `client_cert` | PEM-encoded TLS client certificate for an mTLS endpoint. Requires `client_key`. |
 | `client_key` | PEM-encoded private key for `client_cert`. Requires `client_cert`. |
@@ -230,11 +231,11 @@ RCLONE_REMARKABLE_REFRESH_INTERVAL=30s \
 	--vfs-write-back 0s \
 	--cache-dir /tmp/rclone-remarkable-cache \
 	--dir-cache-time 30s \
-	--poll-interval 0 \
+	--poll-interval 30s \
 	--attr-timeout 1s
 ```
 
-Use an absolute persistent `--cache-dir` for normal operation. `full` mode gives editors and other POSIX applications stable local seek/read behavior; `--vfs-write-back 0s` starts remote creation as soon as a new file closes. Polling is disabled because this backend does not implement rclone's change-notify interface; instead, `refresh_interval` bounds rmapi metadata refreshes during listings. Keep `--dir-cache-time` near that interval. Successful mutations update rmapi's in-process tree immediately, so they do not wait for either interval.
+Use an absolute persistent `--cache-dir` for normal operation. `full` mode gives editors and other POSIX applications stable local seek/read behavior; `--vfs-write-back 0s` starts remote creation as soon as a new file closes. `--poll-interval` enables automatic rmapi metadata refresh and invalidates VFS directory caches when the remote sync root changes, so changes made on the tablet or by another client become visible without waiting for `--dir-cache-time`. A zero poll interval disables automatic refresh; `refresh_interval` remains a fallback for direct listings and non-mount commands. Successful mutations update rmapi's in-process tree immediately.
 
 The backend content cache remains keyed by UUID and remote version beneath `<cache-dir>/remarkable`. When `--cache-dir` differs from rclone's normal interactive default, rmapi metadata is stored separately at `<cache-dir>/remarkable-metadata/<account-hash>/tree.cache`. The account hash is deterministic per host and user token and does not expose either value. Metadata-only file moves atomically derive the new version from the cached `.rmdoc` and rewrite its embedded metadata, avoiding a remote content download. The VFS cache is a separate rclone-managed layer. Testing confirmed repeated stats, copy-out, and eight concurrent opens reused one VFS entry; unmount left valid ZIP archives and no `.materializing-*` or `.promoting-*` files.
 
@@ -291,7 +292,7 @@ Importing `nixosModules.default` adds the custom package to `system.fsPackages`.
 							"vfs_cache_mode=full"
 							"vfs_write_back=0s"
 							"dir_cache_time=30s"
-							"poll_interval=0"
+							"poll_interval=30s"
 							"attr_timeout=1s"
 
 							# Include these only when rmfakecloud is a local NixOS service.

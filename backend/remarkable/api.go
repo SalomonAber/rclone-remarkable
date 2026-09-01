@@ -52,6 +52,7 @@ const (
 // Client isolates rclone filesystem behavior from rmapi's concrete API.
 type Client interface {
 	List(ctx context.Context, parentID string) ([]Item, error)
+	Refresh(ctx context.Context) (bool, error)
 	Get(ctx context.Context, id string) (Item, error)
 	Download(ctx context.Context, id string, dst io.Writer) error
 	Upload(ctx context.Context, parentID, sourcePath string) (Item, error)
@@ -66,6 +67,9 @@ type rmapiClient struct {
 	host            string
 	refreshInterval time.Duration
 	lastRefresh     time.Time
+	lastNotifyHash  string
+	lastNotifyGen   int64
+	lastNotifySet   bool
 }
 
 // rmapiHostMu serializes rmapi's process-wide endpoint configuration
@@ -257,6 +261,28 @@ func (c *rmapiClient) List(_ context.Context, parentID string) ([]Item, error) {
 		items = append(items, item)
 	}
 	return items, nil
+}
+
+// Refresh forces an rmapi metadata refresh and reports whether the remote
+// sync root changed since the previous notification refresh. The first
+// refresh is considered a change so a newly started mount cannot retain
+// entries cached before polling began.
+func (c *rmapiClient) Refresh(_ context.Context) (bool, error) {
+	rmapiHostMu.Lock()
+	configureRMAPIHost(c.host)
+	defer rmapiHostMu.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	hash, generation, err := c.api.Refresh()
+	if err != nil {
+		return false, fmt.Errorf("rmapi: refresh file tree: %w", err)
+	}
+	c.lastRefresh = time.Now()
+	changed := !c.lastNotifySet || hash != c.lastNotifyHash || generation != c.lastNotifyGen
+	c.lastNotifyHash = hash
+	c.lastNotifyGen = generation
+	c.lastNotifySet = true
+	return changed, nil
 }
 
 func (c *rmapiClient) Get(_ context.Context, id string) (Item, error) {

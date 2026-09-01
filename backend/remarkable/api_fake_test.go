@@ -25,6 +25,9 @@ type fakeClient struct {
 	moves           []moveCall
 	mkdirs          []mkdirCall
 	removes         []string
+	refreshes       int
+	refreshChanged  bool
+	refreshErr      error
 	nextID          int
 	downloadStarted chan struct{}
 	releaseDownload chan struct{}
@@ -56,6 +59,15 @@ func (c *fakeClient) List(_ context.Context, parentID string) ([]Item, error) {
 		}
 	}
 	return items, nil
+}
+
+func (c *fakeClient) Refresh(_ context.Context) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.refreshes++
+	changed := c.refreshChanged
+	c.refreshChanged = false
+	return changed, c.refreshErr
 }
 
 func (c *fakeClient) Get(_ context.Context, id string) (Item, error) {
@@ -184,6 +196,57 @@ func TestBackendRegistered(t *testing.T) {
 	}
 	if info.Name != "remarkable" {
 		t.Fatalf("registered backend name = %q", info.Name)
+	}
+}
+
+func TestChangeNotifyRefreshesAndInvalidatesDirectoryTree(t *testing.T) {
+	client := &fakeClient{
+		items: map[string]Item{
+			"folder": {ID: "folder", Name: "Folder", Kind: ItemDirectory},
+			"nested": {ID: "nested", Name: "Nested", ParentID: "folder", Kind: ItemDirectory},
+			"doc":    {ID: "doc", Name: "Document", ParentID: "nested", Kind: ItemDocument},
+		},
+		refreshChanged: true,
+	}
+	backend, err := newFs(context.Background(), "test", "", client, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backend.Features().ChangeNotify == nil {
+		t.Fatal("ChangeNotify feature was not advertised")
+	}
+	intervals := make(chan time.Duration, 1)
+	notifications := make(chan string, 3)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	backend.ChangeNotify(ctx, func(remote string, entryType fs.EntryType) {
+		if entryType != fs.EntryDirectory {
+			t.Errorf("notification type = %v, want directory", entryType)
+		}
+		notifications <- remote
+	}, intervals)
+	intervals <- time.Millisecond
+
+	want := map[string]bool{"": true, "Folder": true, "Folder/Nested": true}
+	for len(want) > 0 {
+		select {
+		case remote := <-notifications:
+			if !want[remote] {
+				t.Fatalf("unexpected notification for %q", remote)
+			}
+			delete(want, remote)
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for notifications; missing %v", want)
+		}
+	}
+	intervals <- 0
+	close(intervals)
+
+	client.mu.Lock()
+	refreshes := client.refreshes
+	client.mu.Unlock()
+	if refreshes == 0 {
+		t.Fatal("metadata was not refreshed")
 	}
 }
 

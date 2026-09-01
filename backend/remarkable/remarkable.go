@@ -36,7 +36,7 @@ func init() {
 			Help: "rmfakecloud or reMarkable API base URL. Defaults to RMAPI_HOST or http://127.0.0.1:7632.",
 		}, {
 			Name:     "refresh_interval",
-			Help:     "Interval between rmapi metadata refreshes while listing.",
+			Help:     "Fallback interval between rmapi metadata refreshes while listing.",
 			Default:  fs.Duration(30 * time.Second),
 			Advanced: true,
 		}, {
@@ -184,6 +184,74 @@ func (f *Fs) String() string           { return fmt.Sprintf("reMarkable root %q"
 func (f *Fs) Precision() time.Duration { return time.Millisecond }
 func (f *Fs) Hashes() hash.Set         { return hash.Set(hash.None) }
 func (f *Fs) Features() *fs.Features   { return f.features }
+
+// ChangeNotify polls rmapi for remote metadata changes and invalidates every
+// known directory in the mounted tree when its sync root changes. rmapi does
+// not expose a per-entry change feed, so invalidating directories is the only
+// reliable way to cover moves, deletions, and changes below already-cached
+// subdirectories.
+func (f *Fs) ChangeNotify(ctx context.Context, notifyFunc func(string, fs.EntryType), pollIntervalChan <-chan time.Duration) {
+	go func() {
+		var ticker *time.Ticker
+		var tickerC <-chan time.Time
+		defer func() {
+			if ticker != nil {
+				ticker.Stop()
+			}
+		}()
+
+		for {
+			select {
+			case interval, ok := <-pollIntervalChan:
+				if !ok {
+					return
+				}
+				if ticker != nil {
+					ticker.Stop()
+					ticker, tickerC = nil, nil
+				}
+				if interval > 0 {
+					ticker = time.NewTicker(interval)
+					tickerC = ticker.C
+				}
+			case <-tickerC:
+				changed, err := f.client.Refresh(ctx)
+				if err != nil {
+					fs.Errorf(f, "ChangeNotify metadata refresh failed: %v", err)
+					continue
+				}
+				if changed {
+					f.notifyDirectoryTree(ctx, notifyFunc)
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+}
+
+func (f *Fs) notifyDirectoryTree(ctx context.Context, notifyFunc func(string, fs.EntryType)) {
+	notifyFunc("", fs.EntryDirectory)
+	seen := map[string]bool{f.rootID: true}
+	var walk func(string, string)
+	walk = func(parentID, remote string) {
+		items, err := f.client.List(ctx, parentID)
+		if err != nil {
+			fs.Errorf(f, "ChangeNotify directory traversal failed at %q: %v", remote, err)
+			return
+		}
+		for _, item := range items {
+			if item.Kind != ItemDirectory || seen[item.ID] {
+				continue
+			}
+			seen[item.ID] = true
+			childRemote := path.Join(remote, localName(item))
+			notifyFunc(childRemote, fs.EntryDirectory)
+			walk(item.ID, childRemote)
+		}
+	}
+	walk(f.rootID, "")
+}
 
 func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
 	if f.client == nil {
@@ -536,7 +604,8 @@ func (f *Fs) destination(ctx context.Context, remote string, kind ItemKind, sour
 }
 
 var (
-	_ fs.Fs       = (*Fs)(nil)
-	_ fs.Mover    = (*Fs)(nil)
-	_ fs.DirMover = (*Fs)(nil)
+	_ fs.Fs             = (*Fs)(nil)
+	_ fs.Mover          = (*Fs)(nil)
+	_ fs.DirMover       = (*Fs)(nil)
+	_ fs.ChangeNotifier = (*Fs)(nil)
 )
