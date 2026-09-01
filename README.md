@@ -144,7 +144,7 @@ rmapi normalizes imported archives, so a later downloaded `.rmdoc` is semantical
 
 ## rmapi findings
 
-The backend temporarily uses `SalomonAber/rmapi` at commit `079db5cbc5e395d1f1c82d9aa951def852abec1d` (2026-09-01), based directly on `ddvk/rmapi` commit `aa60dac8a8dbb1b4eb6a25f2caf2f3daea573373`. The fork adds a caller-configurable sync metadata cache directory and will be replaced by upstream `ddvk/rmapi` once that API is available there. The module still declares `github.com/juruen/rmapi`, so `go.mod` requires that path and uses a replacement. This revision also includes ddvk's root-index canonical sorting fix and newer sync and document-format fixes.
+The backend temporarily uses `SalomonAber/rmapi` at commit `5bf5135049c30e35e1c5797209d42a7ffc23507a` (2026-09-01), based on `ddvk/rmapi` commit `aa60dac8a8dbb1b4eb6a25f2caf2f3daea573373`. The fork adds a caller-configurable sync metadata cache directory, preserves transport error sentinels during the initial mirror so expired user tokens can be refreshed safely, and redacts authorization headers from trace dumps. It will be replaced by upstream `ddvk/rmapi` once those APIs are available there. The module still declares `github.com/juruen/rmapi`, so `go.mod` requires that path and uses a replacement. This revision also includes ddvk's root-index canonical sorting fix and newer sync and document-format fixes.
 
 The relevant library surface is the sync 1.5 `api.ApiCtx` and its `filetree`/`model` packages:
 
@@ -179,6 +179,10 @@ The backend accepts these options:
 | `user_token` | Overrides `usertoken` from the config file. |
 
 `usertoken` is required. This backend deliberately does not use rmapi's interactive token helper because it may terminate the process on configuration failures. Refresh an expired user token with rmapi or provide an updated YAML file/token.
+
+If the initial sync mirror rejects the configured user token, the backend uses the existing device token to request a replacement and retries initialization exactly once. A rejected or missing device token returns an error explaining that device re-registration is required. The replacement token remains in memory for the lifetime of that client; the backend never rewrites the configured YAML file, including an agenix-managed read-only file.
+
+Go callers that need to persist a replacement explicitly can set `Options.OnUserTokenRefresh` and construct the client with `remarkable.NewConfiguredRMAPIClient`. The callback runs only after initialization succeeds with the replacement token. Its implementation is responsible for storing the secret securely; rclone configuration does not expose this callback.
 
 For an rmfakecloud endpoint requiring mutual TLS:
 

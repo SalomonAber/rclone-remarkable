@@ -76,6 +76,8 @@ type Options struct {
 	ClientKey       string      `config:"client_key"`
 	DeviceToken     string      `config:"device_token"`
 	UserToken       string      `config:"user_token"`
+	// OnUserTokenRefresh receives a refreshed token after initialization succeeds.
+	OnUserTokenRefresh func(string) error `config:"-"`
 }
 
 // Fs represents a remarkable document tree.
@@ -108,7 +110,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 	opt.Host, root = normalizeConnectionHost(opt.Host, root)
 	rcloneCacheDir := config.GetCacheDir()
-	client, err := newConfiguredRMAPIClient(*opt, rmapiMetadataCacheRoot(rcloneCacheDir))
+	client, err := NewConfiguredRMAPIClient(*opt, rmapiMetadataCacheRoot(rcloneCacheDir))
 	if err != nil {
 		return nil, err
 	}

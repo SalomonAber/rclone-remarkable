@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -43,6 +44,125 @@ func (f *fakeAPICtx) Refresh() (string, int64, error)           { return "", 0, 
 
 var _ rmapi.ApiCtx = (*fakeAPICtx)(nil)
 
+func TestRMAPIUserTokenRefreshSuccess(t *testing.T) {
+	originalCreate := createRMAPIContext
+	originalRefresh := refreshRMAPIUserToken
+	t.Cleanup(func() {
+		createRMAPIContext = originalCreate
+		refreshRMAPIUserToken = originalRefresh
+	})
+
+	createCalls := 0
+	createRMAPIContext = func(httpCtx *transport.HttpClientCtx, _ rmapi.SyncVersion, _ rmapi.Options) (rmapi.ApiCtx, error) {
+		createCalls++
+		if createCalls == 1 {
+			return nil, transport.ErrUnauthorized
+		}
+		if httpCtx.Tokens.UserToken != "refreshed-user-token" {
+			t.Fatalf("retry user token was not replaced")
+		}
+		tree := filetree.CreateFileTreeCtx()
+		return &fakeAPICtx{tree: &tree}, nil
+	}
+	refreshCalls := 0
+	refreshRMAPIUserToken = func(httpCtx *transport.HttpClientCtx) (string, error) {
+		refreshCalls++
+		if httpCtx.Tokens.DeviceToken != "valid-device-token" {
+			t.Fatal("refresh did not use the configured device token")
+		}
+		return "refreshed-user-token", nil
+	}
+	var callbackToken string
+	client, err := NewConfiguredRMAPIClient(Options{
+		Host:        "https://cloud.example",
+		DeviceToken: "valid-device-token",
+		UserToken:   "expired-user-token",
+		OnUserTokenRefresh: func(token string) error {
+			callbackToken = token
+			return nil
+		},
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client == nil || createCalls != 2 || refreshCalls != 1 {
+		t.Fatalf("client=%v create calls=%d refresh calls=%d", client, createCalls, refreshCalls)
+	}
+	if callbackToken != "refreshed-user-token" {
+		t.Fatal("refresh callback did not receive the new token")
+	}
+}
+
+func TestRMAPIUserTokenRefreshRejectedDeviceToken(t *testing.T) {
+	originalCreate := createRMAPIContext
+	originalRefresh := refreshRMAPIUserToken
+	t.Cleanup(func() {
+		createRMAPIContext = originalCreate
+		refreshRMAPIUserToken = originalRefresh
+	})
+
+	createCalls := 0
+	createRMAPIContext = func(_ *transport.HttpClientCtx, _ rmapi.SyncVersion, _ rmapi.Options) (rmapi.ApiCtx, error) {
+		createCalls++
+		return nil, transport.ErrUnauthorized
+	}
+	refreshCalls := 0
+	refreshRMAPIUserToken = func(_ *transport.HttpClientCtx) (string, error) {
+		refreshCalls++
+		return "", transport.ErrUnauthorized
+	}
+
+	_, err := NewConfiguredRMAPIClient(Options{
+		Host:        "https://cloud.example",
+		DeviceToken: "rejected-device-token",
+		UserToken:   "expired-user-token",
+	}, "")
+	if err == nil || !strings.Contains(err.Error(), "device re-registration is required") {
+		t.Fatalf("error = %v", err)
+	}
+	if createCalls != 1 || refreshCalls != 1 {
+		t.Fatalf("create calls=%d refresh calls=%d", createCalls, refreshCalls)
+	}
+	if strings.Contains(err.Error(), "rejected-device-token") || strings.Contains(err.Error(), "expired-user-token") {
+		t.Fatalf("error leaks a token: %v", err)
+	}
+}
+
+func TestRMAPIUserTokenRefreshRetryLimit(t *testing.T) {
+	originalCreate := createRMAPIContext
+	originalRefresh := refreshRMAPIUserToken
+	t.Cleanup(func() {
+		createRMAPIContext = originalCreate
+		refreshRMAPIUserToken = originalRefresh
+	})
+
+	createCalls := 0
+	createRMAPIContext = func(_ *transport.HttpClientCtx, _ rmapi.SyncVersion, _ rmapi.Options) (rmapi.ApiCtx, error) {
+		createCalls++
+		return nil, transport.ErrUnauthorized
+	}
+	refreshCalls := 0
+	refreshRMAPIUserToken = func(_ *transport.HttpClientCtx) (string, error) {
+		refreshCalls++
+		return "still-rejected-user-token", nil
+	}
+
+	_, err := NewConfiguredRMAPIClient(Options{
+		Host:        "https://cloud.example",
+		DeviceToken: "valid-device-token",
+		UserToken:   "expired-user-token",
+	}, "")
+	if err == nil || !strings.Contains(err.Error(), "refreshed user token was rejected") {
+		t.Fatalf("error = %v", err)
+	}
+	if createCalls != 2 || refreshCalls != 1 {
+		t.Fatalf("create calls=%d refresh calls=%d", createCalls, refreshCalls)
+	}
+	if strings.Contains(err.Error(), "still-rejected-user-token") {
+		t.Fatalf("error leaks refreshed token: %v", err)
+	}
+}
+
 func TestRMAPIExplicitCacheWithoutHome(t *testing.T) {
 	t.Setenv("HOME", "")
 	t.Setenv("XDG_CACHE_HOME", "")
@@ -64,8 +184,8 @@ func TestRMAPIExplicitCacheWithoutHome(t *testing.T) {
 	}
 
 	opt := Options{Host: "https://cloud.example", UserToken: "test-user-token"}
-	if _, err := newConfiguredRMAPIClient(opt, metadataRoot); err != nil {
-		t.Fatalf("newConfiguredRMAPIClient without HOME/XDG_CACHE_HOME: %v", err)
+	if _, err := NewConfiguredRMAPIClient(opt, metadataRoot); err != nil {
+		t.Fatalf("NewConfiguredRMAPIClient without HOME/XDG_CACHE_HOME: %v", err)
 	}
 	accountID := sha256.Sum256([]byte(opt.Host + "\x00" + opt.UserToken))
 	wantCacheDir := filepath.Join(wantRoot, fmt.Sprintf("%x", accountID))
@@ -113,7 +233,7 @@ func TestRMAPIDefaultCachePreservesInteractiveBehavior(t *testing.T) {
 		tree := filetree.CreateFileTreeCtx()
 		return &fakeAPICtx{tree: &tree}, nil
 	}
-	if _, err := newConfiguredRMAPIClient(Options{Host: "https://cloud.example", UserToken: "test-user-token"}, ""); err != nil {
+	if _, err := NewConfiguredRMAPIClient(Options{Host: "https://cloud.example", UserToken: "test-user-token"}, ""); err != nil {
 		t.Fatal(err)
 	}
 	if gotOptions.CacheDir != "" {

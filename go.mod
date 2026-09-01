@@ -132,4 +132,4 @@ require (
 	moul.io/http2curl/v2 v2.3.0 // indirect
 )
 
-replace github.com/juruen/rmapi => github.com/SalomonAber/rmapi v0.0.0-20260901125535-079db5cbc5e3
+replace github.com/juruen/rmapi => github.com/SalomonAber/rmapi v0.0.0-20260901155011-5bf5135049c3

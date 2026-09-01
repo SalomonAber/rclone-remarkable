@@ -33,7 +33,7 @@ func TestRMFakecloudIntegration(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	client, err := newConfiguredRMAPIClient(Options{
+	client, err := NewConfiguredRMAPIClient(Options{
 		Host:            host,
 		RefreshInterval: fs.Duration(time.Second),
 		Config:          configPath,

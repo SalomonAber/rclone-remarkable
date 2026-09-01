@@ -25,6 +25,11 @@ import (
 var errItemNotFound = errors.New("item not found")
 
 var createRMAPIContext = rmapi.CreateApiCtxWithOptions
+var refreshRMAPIUserToken = func(httpCtx *transport.HttpClientCtx) (string, error) {
+	response := transport.BodyString{}
+	err := httpCtx.Post(transport.DeviceBearer, rmconfig.NewUserDevice, nil, &response)
+	return response.Content, err
+}
 
 // Item is the backend's representation of a reMarkable tree entry.
 type Item struct {
@@ -76,7 +81,8 @@ func newRMAPIClient(api rmapi.ApiCtx, host string, refreshInterval time.Duration
 	return &rmapiClient{api: api, host: host, refreshInterval: refreshInterval, lastRefresh: time.Now()}
 }
 
-func newConfiguredRMAPIClient(opt Options, metadataCacheRoot string) (Client, error) {
+// NewConfiguredRMAPIClient creates an rmapi-backed client with optional token refresh persistence.
+func NewConfiguredRMAPIClient(opt Options, metadataCacheRoot string) (Client, error) {
 	httpCtx, err := newRMAPIHTTPClientCtx(opt)
 	if err != nil {
 		return nil, err
@@ -100,16 +106,49 @@ func newConfiguredRMAPIClient(opt Options, metadataCacheRoot string) (Client, er
 		accountID := sha256.Sum256([]byte(opt.Host + "\x00" + tokens.UserToken))
 		metadataCacheDir = filepath.Join(metadataCacheRoot, fmt.Sprintf("%x", accountID))
 	}
-	apiCtx, err := createRMAPIContext(&httpCtx, rmapi.Version15, rmapi.Options{CacheDir: metadataCacheDir})
+	apiCtx, refreshedToken, err := createRMAPIContextWithRefresh(&httpCtx, rmapi.Options{CacheDir: metadataCacheDir})
 	rmapiHostMu.Unlock()
 	if err != nil {
 		return nil, fmt.Errorf("remarkable: initialize rmapi sync client: %w", err)
+	}
+	if refreshedToken != "" && opt.OnUserTokenRefresh != nil {
+		if err := opt.OnUserTokenRefresh(refreshedToken); err != nil {
+			return nil, errors.New("remarkable: user token refreshed but persistence callback failed")
+		}
 	}
 	refreshInterval := time.Duration(opt.RefreshInterval)
 	if refreshInterval <= 0 {
 		refreshInterval = 30 * time.Second
 	}
 	return newRMAPIClient(apiCtx, opt.Host, refreshInterval), nil
+}
+
+func createRMAPIContextWithRefresh(httpCtx *transport.HttpClientCtx, options rmapi.Options) (rmapi.ApiCtx, string, error) {
+	apiCtx, err := createRMAPIContext(httpCtx, rmapi.Version15, options)
+	if !errors.Is(err, transport.ErrUnauthorized) {
+		return apiCtx, "", err
+	}
+	if httpCtx.Tokens.DeviceToken == "" {
+		return nil, "", errors.New("user token expired and no device token is available; device re-registration is required")
+	}
+
+	userToken, err := refreshRMAPIUserToken(httpCtx)
+	if errors.Is(err, transport.ErrUnauthorized) {
+		return nil, "", errors.New("device token was rejected; device re-registration is required")
+	}
+	if err != nil {
+		return nil, "", errors.New("failed to refresh user token")
+	}
+	if userToken == "" {
+		return nil, "", errors.New("user-token refresh returned an empty token; device re-registration may be required")
+	}
+
+	httpCtx.Tokens.UserToken = userToken
+	apiCtx, err = createRMAPIContext(httpCtx, rmapi.Version15, options)
+	if errors.Is(err, transport.ErrUnauthorized) {
+		return nil, "", errors.New("refreshed user token was rejected")
+	}
+	return apiCtx, userToken, err
 }
 
 // newRMAPIHTTPClientCtx configures rmapi's private HTTP client.
