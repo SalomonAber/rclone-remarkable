@@ -143,6 +143,77 @@ Copying a valid new `.rmdoc` into the mount is supported. Opening an existing re
 - rmapi persists its sync tree separately in the OS cache directory (`rmapi/tree.cache`), outside rclone's `--cache-dir`. The client refreshes that tree during construction and periodically while listing.
 - rmfakecloud supports the sync 1.5/v3/v4 routes used by current rmapi. Its deployment must issue a valid sync 1.5 user token and configure a storage URL reachable by the client; newer reMarkable software has additional HTTPS/no-port restrictions documented by rmfakecloud.
 
+## NixOS
+
+The flake's default package builds the custom binary and provides `rclone`, `rclone-remarkable`, `rclonefs`, and `mount.rclone`. The last two are symlinks to the wrapped custom binary, matching nixpkgs' stock rclone package. The wrapper adds FUSE 3 utilities to its fallback PATH without shadowing NixOS's privileged `/run/wrappers/bin/fusermount3`.
+
+Importing `nixosModules.default` adds the custom package to `system.fsPackages`. Current NixOS includes those packages in the systemd manager and fstab-generator PATH, so the standard mount unit resolves this package's `mount.rclone`; no custom service is needed. NixOS does not automatically add stock rclone for `fsType = "rclone"`. Avoid adding both helpers to `system.fsPackages`; the custom package has a higher package priority so it also wins profile collisions if stock rclone is installed separately.
+
+```nix
+{
+	inputs.rclone-remarkable.url = "github:poplicola/rclone-remarkable";
+
+	outputs = inputs@{ nixpkgs, rclone-remarkable, ... }: {
+		nixosConfigurations.host = nixpkgs.lib.nixosSystem {
+			system = "x86_64-linux";
+			modules = [
+				rclone-remarkable.nixosModules.default
+				({ ... }: {
+					environment.etc."rclone-remarkable.conf".text = ''
+						[remarkable]
+						type = remarkable
+						host = http://127.0.0.1:7632
+						config = /run/agenix/rmapi-config
+						refresh_interval = 30s
+					'';
+
+					systemd.tmpfiles.rules = [
+						"d /var/cache/rclone/remarkable 0750 root root -"
+					];
+
+          programs.fuse.userAllowOther = true;
+
+					fileSystems."/mnt/remarkable" = {
+						device = "remarkable:";
+						fsType = "rclone";
+						options = [
+							"nodev"
+							"nofail"
+							"_netdev"
+							"allow_other"
+							"args2env"
+							"config=/etc/rclone-remarkable.conf"
+							"cache_dir=/var/cache/rclone/remarkable"
+							"vfs_cache_mode=full"
+							"vfs_write_back=0s"
+							"dir_cache_time=30s"
+							"poll_interval=0"
+							"attr_timeout=1s"
+
+							# Include these only when rmfakecloud is a local NixOS service.
+							"x-systemd.requires=rmfakecloud.service"
+							"x-systemd.after=rmfakecloud.service"
+						];
+					};
+				})
+			];
+		};
+	};
+}
+```
+
+For a remote rmfakecloud, omit the two `rmfakecloud.service` options; `_netdev` supplies normal network-mount ordering. `nofail` prevents an unavailable cloud from failing boot. Add `x-systemd.automount` when on-demand mounting is preferable.
+
+The non-secret rclone config can live in the Nix store because it only references `/run/agenix/rmapi-config`; the YAML containing `devicetoken` and `usertoken` must be deployed by agenix outside the store. After rebuilding, verify with:
+
+```sh
+mount | grep remarkable
+ls /mnt/remarkable
+mv /mnt/remarkable/Test.rmdoc /mnt/remarkable/Renamed.rmdoc
+```
+
+The final rename maps to one rmapi metadata move on the existing UUID. Verify identity with rmfakecloud's document metadata/API or by comparing the `ID` before and after in an integration test.
+
 ## Development
 
 ```sh
