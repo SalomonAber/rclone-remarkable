@@ -6,26 +6,56 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
+	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/fs/hash"
 )
 
 var errClientUnavailable = errors.New("remarkable client is not configured")
 var errDestinationExists = errors.New("destination already exists")
+var splitConnectionHost = regexp.MustCompile(`^(\[[^]]+\]|[^/:]+):(\d+)(?::(.*))?$`)
 
 func init() {
 	fs.Register(&fs.RegInfo{
 		Name:        "remarkable",
 		Description: "reMarkable document tree via rmapi",
 		NewFs:       NewFs,
+		Options: []fs.Option{{
+			Name: "host",
+			Help: "rmfakecloud or reMarkable API base URL. Defaults to RMAPI_HOST or http://127.0.0.1:7632.",
+		}, {
+			Name:     "config",
+			Help:     "Path to an rmapi YAML config containing devicetoken and usertoken.",
+			Advanced: true,
+		}, {
+			Name:      "device_token",
+			Help:      "rmapi device token. Overrides the config file value.",
+			Advanced:  true,
+			Sensitive: true,
+		}, {
+			Name:      "user_token",
+			Help:      "rmapi user token. Overrides the config file value.",
+			Advanced:  true,
+			Sensitive: true,
+		}},
 	})
+}
+
+// Options configures the rmapi library client.
+type Options struct {
+	Host        string `config:"host"`
+	Config      string `config:"config"`
+	DeviceToken string `config:"device_token"`
+	UserToken   string `config:"user_token"`
 }
 
 // Fs represents a remarkable document tree.
@@ -38,13 +68,41 @@ type Fs struct {
 	cache    *contentCache
 }
 
-// NewFs constructs a filesystem without connecting to rmfakecloud in this stage.
-func NewFs(ctx context.Context, name, root string, _ configmap.Mapper) (fs.Fs, error) {
-	f, err := newFs(ctx, name, root, nil, filepath.Join(config.GetCacheDir(), "remarkable"))
-	if err != nil && !errors.Is(err, errClientUnavailable) {
+// NewFs constructs a filesystem backed by a configured rmapi sync 1.5 client.
+func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
+	opt := new(Options)
+	if err := configstruct.Set(m, opt); err != nil {
 		return nil, err
 	}
-	return f, nil
+	if opt.Host == "" {
+		opt.Host = os.Getenv("RMAPI_HOST")
+	}
+	if opt.Host == "" {
+		opt.Host = "http://127.0.0.1:7632"
+	}
+	if opt.Config == "" {
+		opt.Config = os.Getenv("RMAPI_CONFIG")
+	}
+	opt.Host, root = normalizeConnectionHost(opt.Host, root)
+	client, err := newConfiguredRMAPIClient(*opt)
+	if err != nil {
+		return nil, err
+	}
+	return newFs(ctx, name, root, client, filepath.Join(config.GetCacheDir(), "remarkable"))
+}
+
+// normalizeConnectionHost repairs unescaped http:// URLs in rclone connection strings.
+// Rclone treats the ':' after "http" as the option/root separator.
+func normalizeConnectionHost(host, root string) (string, string) {
+	if (host != "http" && host != "https") || !strings.HasPrefix(root, "//") {
+		return host, root
+	}
+	matches := splitConnectionHost.FindStringSubmatch(strings.TrimPrefix(root, "//"))
+	if matches == nil {
+		return host, root
+	}
+	endpoint := host + "://" + matches[1] + ":" + matches[2]
+	return endpoint, matches[3]
 }
 
 func newFs(ctx context.Context, name, root string, client Client, cacheDir string) (*Fs, error) {

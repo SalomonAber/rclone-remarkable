@@ -307,6 +307,13 @@ func rmdocArchive(t *testing.T, id string) []byte {
 	if _, err := entry.Write([]byte(`{"visibleName":"test"}`)); err != nil {
 		t.Fatal(err)
 	}
+	entry, err = writer.Create(id + ".content")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := entry.Write([]byte(`{}`)); err != nil {
+		t.Fatal(err)
+	}
 	if err := writer.Close(); err != nil {
 		t.Fatal(err)
 	}

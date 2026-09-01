@@ -1,6 +1,6 @@
 # rclone-remarkable
 
-An out-of-tree rclone backend named `remarkable`. The current model exposes reMarkable collections as directories and documents as raw ZIP-compatible `.rmdoc` objects. Metadata mutations are supported, but arbitrary `.rmdoc` writes and live rmfakecloud client construction are not wired yet; behavior is exercised against the fake client.
+An out-of-tree rclone backend named `remarkable`. The current model exposes reMarkable collections as directories and documents as raw ZIP-compatible `.rmdoc` objects. Metadata mutations are supported, but arbitrary `.rmdoc` writes remain unsupported.
 
 ## Architecture
 
@@ -68,7 +68,47 @@ The relevant library surface is the sync 1.5 `api.ApiCtx` and its `filetree`/`mo
 
 rmapi also creates a synthetic `trash` collection in its file tree. Deletion uses rmapi's normal non-recursive `DeleteEntry` operation; non-empty directories are rejected with rclone's `ErrorDirectoryNotEmpty` before that call.
 
-`backend/remarkable/api.go` isolates this dependency behind a small `Client` using backend-owned `Item` values. The adapter handles rmapi's path-based `FetchDocument` through a temporary `.rmdoc` file, while callers use an `io.Writer`. Authentication and construction of a live `api.ApiCtx` remain deliberately unwired.
+`backend/remarkable/api.go` isolates this dependency behind a small `Client` using backend-owned `Item` values. The adapter constructs rmapi's sync 1.5 `api.ApiCtx` directly using `transport.CreateHttpClientCtx` and `api.CreateApiCtx`; no rmapi subprocess is used. It handles rmapi's path-based `FetchDocument` through a temporary `.rmdoc` file, while callers use an `io.Writer`.
+
+## Configuration
+
+The backend accepts these options:
+
+| Option | Purpose |
+| --- | --- |
+| `host` | API base URL. Defaults to `RMAPI_HOST`, then `http://127.0.0.1:7632`. |
+| `config` | YAML credentials file with `devicetoken` and `usertoken`. Defaults to `RMAPI_CONFIG`. |
+| `device_token` | Overrides `devicetoken` from the config file. |
+| `user_token` | Overrides `usertoken` from the config file. |
+
+`usertoken` is required. This backend deliberately does not use rmapi's interactive token helper because it may terminate the process on configuration failures. Refresh an expired user token with rmapi or provide an updated YAML file/token.
+
+With a compatible rmapi config already selected through `RMAPI_CONFIG`, use:
+
+```sh
+go build -o rclone .
+./rclone lsf :remarkable,host=http://127.0.0.1:7632:
+./rclone copyto :remarkable,host=http://127.0.0.1:7632:Work/Existing.rmdoc /tmp/Existing.rmdoc
+```
+
+## Integration Test
+
+The integration suite is disabled by default. It creates uniquely named top-level folders, uploads a generated controlled `.rmdoc`, verifies list/rename/move/download/delete behavior, and removes its test folders. It never selects unrelated documents.
+
+```sh
+REMARKABLE_INTEGRATION=1 \
+RMAPI_CONFIG=/path/to/rmapi.conf \
+go test ./backend/remarkable -run TestRMFakecloudIntegration -count=1
+```
+
+Set `REMARKABLE_HOST` to override the integration endpoint and `REMARKABLE_USER_TOKEN`/`REMARKABLE_DEVICE_TOKEN` to supply credentials without a YAML file.
+
+## Compatibility Notes
+
+- rmapi's endpoint URLs are package-global values. The backend sets them from `host` before constructing its client, so different `remarkable` hosts are not safe to use simultaneously in one rclone process.
+- Rclone connection strings use `:` to separate options from the remote path, which normally splits an unescaped `http://host:port` value. The backend recognizes and repairs the resulting parsed form for HTTP/HTTPS hosts with numeric ports, so the short command examples above work as written. Standard configured remotes and escaped connection strings do not need this compatibility path.
+- rmapi persists its sync tree separately in the OS cache directory (`rmapi/tree.cache`), outside rclone's `--cache-dir`. The client refreshes that tree during construction and after the integration test's direct upload setup.
+- rmfakecloud supports the sync 1.5/v3/v4 routes used by current rmapi. Its deployment must issue a valid sync 1.5 user token and configure a storage URL reachable by the client; newer reMarkable software has additional HTTPS/no-port restrictions documented by rmfakecloud.
 
 ## Development
 
@@ -77,8 +117,8 @@ nix develop
 go build ./...
 go test ./...
 go vet ./...
-go build -o rclone-remarkable .
-./rclone-remarkable help backends
+go build -o rclone .
+./rclone help backends
 ```
 
 The last command should list `remarkable`.

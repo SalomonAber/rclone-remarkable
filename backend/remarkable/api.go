@@ -5,10 +5,14 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	rmapi "github.com/juruen/rmapi/api"
+	rmconfig "github.com/juruen/rmapi/config"
 	"github.com/juruen/rmapi/model"
+	"github.com/juruen/rmapi/transport"
+	"gopkg.in/yaml.v2"
 )
 
 // Item is the backend's representation of a reMarkable tree entry.
@@ -45,6 +49,65 @@ type rmapiClient struct {
 
 func newRMAPIClient(api rmapi.ApiCtx) Client {
 	return &rmapiClient{api: api}
+}
+
+func newConfiguredRMAPIClient(opt Options) (Client, error) {
+	tokens, err := rmapiTokens(opt)
+	if err != nil {
+		return nil, err
+	}
+	if tokens.UserToken == "" {
+		return nil, fmt.Errorf("remarkable: user token is required; set user_token or provide config with usertoken")
+	}
+
+	configureRMAPIHost(opt.Host)
+	httpCtx := transport.CreateHttpClientCtx(tokens)
+	apiCtx, err := rmapi.CreateApiCtx(&httpCtx, rmapi.Version15)
+	if err != nil {
+		return nil, fmt.Errorf("remarkable: initialize rmapi sync client: %w", err)
+	}
+	return newRMAPIClient(apiCtx), nil
+}
+
+func rmapiTokens(opt Options) (model.AuthTokens, error) {
+	tokens := model.AuthTokens{
+		DeviceToken: opt.DeviceToken,
+		UserToken:   opt.UserToken,
+	}
+	if opt.Config == "" {
+		return tokens, nil
+	}
+	data, err := os.ReadFile(opt.Config)
+	if err != nil {
+		return model.AuthTokens{}, fmt.Errorf("remarkable: read rmapi config %q: %w", opt.Config, err)
+	}
+	var fileTokens model.AuthTokens
+	if err := yaml.Unmarshal(data, &fileTokens); err != nil {
+		return model.AuthTokens{}, fmt.Errorf("remarkable: parse rmapi config %q: %w", opt.Config, err)
+	}
+	if tokens.DeviceToken == "" {
+		tokens.DeviceToken = fileTokens.DeviceToken
+	}
+	if tokens.UserToken == "" {
+		tokens.UserToken = fileTokens.UserToken
+	}
+	return tokens, nil
+}
+
+func configureRMAPIHost(host string) {
+	host = strings.TrimRight(host, "/")
+	rmconfig.NewTokenDevice = host + "/token/json/2/device/new"
+	rmconfig.NewUserDevice = host + "/token/json/2/user/new"
+	rmconfig.ListDocs = host + "/document-storage/json/2/docs"
+	rmconfig.UpdateStatus = host + "/document-storage/json/2/upload/update-status"
+	rmconfig.UploadRequest = host + "/document-storage/json/2/upload/request"
+	rmconfig.DeleteEntry = host + "/document-storage/json/2/delete"
+	rmconfig.UploadBlob = host + "/sync/v2/signed-urls/uploads"
+	rmconfig.DownloadBlob = host + "/sync/v2/signed-urls/downloads"
+	rmconfig.SyncComplete = host + "/sync/v2/sync-complete"
+	rmconfig.BlobUrl = host + "/sync/v3/files/"
+	rmconfig.RootGet = host + "/sync/v4/root"
+	rmconfig.RootPut = host + "/sync/v3/root"
 }
 
 func (c *rmapiClient) List(_ context.Context, parentID string) ([]Item, error) {

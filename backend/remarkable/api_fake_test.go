@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -177,5 +179,35 @@ func TestItemFromDocument(t *testing.T) {
 	wantTime := time.Date(2026, time.September, 1, 8, 30, 0, 123_000_000, time.UTC)
 	if !item.ModTime.Equal(wantTime) {
 		t.Fatalf("modification time = %s, want %s", item.ModTime, wantTime)
+	}
+}
+
+func TestRMAPIConfigTokensAndOverrides(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "rmapi.conf")
+	if err := os.WriteFile(configPath, []byte("devicetoken: from-file-device\nusertoken: from-file-user\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tokens, err := rmapiTokens(Options{Config: configPath, UserToken: "explicit-user"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tokens.DeviceToken != "from-file-device" || tokens.UserToken != "explicit-user" {
+		t.Fatalf("tokens = %#v", tokens)
+	}
+}
+
+func TestNormalizeConnectionHost(t *testing.T) {
+	tests := []struct {
+		host, root, wantHost, wantRoot string
+	}{
+		{host: "http", root: "//127.0.0.1:7632", wantHost: "http://127.0.0.1:7632", wantRoot: ""},
+		{host: "http", root: "//127.0.0.1:7632:Work/Existing.rmdoc", wantHost: "http://127.0.0.1:7632", wantRoot: "Work/Existing.rmdoc"},
+		{host: "https://cloud.example", root: "Work", wantHost: "https://cloud.example", wantRoot: "Work"},
+	}
+	for _, test := range tests {
+		host, root := normalizeConnectionHost(test.host, test.root)
+		if host != test.wantHost || root != test.wantRoot {
+			t.Fatalf("normalizeConnectionHost(%q, %q) = (%q, %q)", test.host, test.root, host, root)
+		}
 	}
 }
