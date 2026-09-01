@@ -12,6 +12,7 @@ import (
 
 	rmapi "github.com/juruen/rmapi/api"
 	rmconfig "github.com/juruen/rmapi/config"
+	"github.com/juruen/rmapi/filetree"
 	"github.com/juruen/rmapi/model"
 	"github.com/juruen/rmapi/transport"
 	"gopkg.in/yaml.v2"
@@ -51,12 +52,22 @@ type Client interface {
 type rmapiClient struct {
 	mu              sync.Mutex
 	api             rmapi.ApiCtx
+	host            string
 	refreshInterval time.Duration
 	lastRefresh     time.Time
 }
 
-func newRMAPIClient(api rmapi.ApiCtx, refreshInterval time.Duration) Client {
-	return &rmapiClient{api: api, refreshInterval: refreshInterval, lastRefresh: time.Now()}
+// rmapiHostMu serializes rmapi's process-wide endpoint configuration
+// (mutated by configureRMAPIHost) with the request that depends on it. rmapi
+// stores its API endpoints in package-level variables rather than per-client
+// state, so multiple *rmapiClient instances (e.g. two configured "remarkable"
+// remotes pointing at different hosts) share that global state. Without this
+// lock, constructing or using a second client can silently repoint an
+// in-flight or subsequent request from a different client at the wrong host.
+var rmapiHostMu sync.Mutex
+
+func newRMAPIClient(api rmapi.ApiCtx, host string, refreshInterval time.Duration) Client {
+	return &rmapiClient{api: api, host: host, refreshInterval: refreshInterval, lastRefresh: time.Now()}
 }
 
 func newConfiguredRMAPIClient(opt Options) (Client, error) {
@@ -68,9 +79,14 @@ func newConfiguredRMAPIClient(opt Options) (Client, error) {
 		return nil, fmt.Errorf("remarkable: user token is required; set user_token or provide config with usertoken")
 	}
 
+	// The host is (re)applied immediately before each request under
+	// rmapiHostMu (see below); CreateApiCtx itself only needs a host to be
+	// configured for its initial tree mirror, so apply it once here too.
+	rmapiHostMu.Lock()
 	configureRMAPIHost(opt.Host)
 	httpCtx := transport.CreateHttpClientCtx(tokens)
 	apiCtx, err := rmapi.CreateApiCtx(&httpCtx, rmapi.Version15)
+	rmapiHostMu.Unlock()
 	if err != nil {
 		return nil, fmt.Errorf("remarkable: initialize rmapi sync client: %w", err)
 	}
@@ -78,7 +94,7 @@ func newConfiguredRMAPIClient(opt Options) (Client, error) {
 	if refreshInterval <= 0 {
 		refreshInterval = 30 * time.Second
 	}
-	return newRMAPIClient(apiCtx, refreshInterval), nil
+	return newRMAPIClient(apiCtx, opt.Host, refreshInterval), nil
 }
 
 func rmapiTokens(opt Options) (model.AuthTokens, error) {
@@ -123,6 +139,9 @@ func configureRMAPIHost(host string) {
 }
 
 func (c *rmapiClient) List(_ context.Context, parentID string) ([]Item, error) {
+	rmapiHostMu.Lock()
+	configureRMAPIHost(c.host)
+	defer rmapiHostMu.Unlock()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if time.Since(c.lastRefresh) >= c.refreshInterval {
@@ -142,6 +161,15 @@ func (c *rmapiClient) List(_ context.Context, parentID string) ([]Item, error) {
 		if err != nil {
 			return nil, err
 		}
+		if parentID == "" && item.ID == filetree.TrashID {
+			// rmapi always synthesizes a "trash" collection as a child of
+			// the root. It is not a real user directory: exposing it here
+			// would (a) collide with, and break listing of, an account that
+			// happens to have a real top-level folder named "trash", and
+			// (b) let Mkdir/Move address it by name, which would move real
+			// documents into rmapi's actual delete/trash mechanism.
+			continue
+		}
 		items = append(items, item)
 	}
 	return items, nil
@@ -158,6 +186,9 @@ func (c *rmapiClient) Get(_ context.Context, id string) (Item, error) {
 }
 
 func (c *rmapiClient) Download(_ context.Context, id string, dst io.Writer) error {
+	rmapiHostMu.Lock()
+	configureRMAPIHost(c.host)
+	defer rmapiHostMu.Unlock()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	tmp, err := os.CreateTemp("", "rclone-remarkable-*.rmdoc")
@@ -183,6 +214,9 @@ func (c *rmapiClient) Download(_ context.Context, id string, dst io.Writer) erro
 }
 
 func (c *rmapiClient) Upload(_ context.Context, parentID, sourcePath string) (Item, error) {
+	rmapiHostMu.Lock()
+	configureRMAPIHost(c.host)
+	defer rmapiHostMu.Unlock()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	doc, err := c.api.UploadDocument(parentID, sourcePath, true, nil, nil, nil, nil)
@@ -194,6 +228,9 @@ func (c *rmapiClient) Upload(_ context.Context, parentID, sourcePath string) (It
 }
 
 func (c *rmapiClient) Move(_ context.Context, id, parentID, name string) (Item, error) {
+	rmapiHostMu.Lock()
+	configureRMAPIHost(c.host)
+	defer rmapiHostMu.Unlock()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	src := c.api.Filetree().NodeById(id)
@@ -210,6 +247,9 @@ func (c *rmapiClient) Move(_ context.Context, id, parentID, name string) (Item, 
 }
 
 func (c *rmapiClient) Mkdir(_ context.Context, parentID, name string) (Item, error) {
+	rmapiHostMu.Lock()
+	configureRMAPIHost(c.host)
+	defer rmapiHostMu.Unlock()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	doc, err := c.api.CreateDir(parentID, name, true)
@@ -221,6 +261,9 @@ func (c *rmapiClient) Mkdir(_ context.Context, parentID, name string) (Item, err
 }
 
 func (c *rmapiClient) Remove(_ context.Context, id string) error {
+	rmapiHostMu.Lock()
+	configureRMAPIHost(c.host)
+	defer rmapiHostMu.Unlock()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	node := c.api.Filetree().NodeById(id)
