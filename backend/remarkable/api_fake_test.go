@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -19,6 +20,8 @@ type fakeClient struct {
 	items           map[string]Item
 	contents        map[string][]byte
 	downloads       map[string]int
+	uploads         []uploadCall
+	uploadErrors    []error
 	moves           []moveCall
 	mkdirs          []mkdirCall
 	removes         []string
@@ -31,6 +34,11 @@ type moveCall struct {
 	ID       string
 	ParentID string
 	Name     string
+}
+
+type uploadCall struct {
+	ParentID   string
+	SourcePath string
 }
 
 type mkdirCall struct {
@@ -55,7 +63,7 @@ func (c *fakeClient) Get(_ context.Context, id string) (Item, error) {
 	defer c.mu.Unlock()
 	item, ok := c.items[id]
 	if !ok {
-		return Item{}, fmt.Errorf("item %q not found", id)
+		return Item{}, fmt.Errorf("%w: %q", errItemNotFound, id)
 	}
 	return item, nil
 }
@@ -88,6 +96,29 @@ func (c *fakeClient) Download(ctx context.Context, id string, dst io.Writer) err
 	}
 	_, err := dst.Write(content)
 	return err
+}
+func (c *fakeClient) Upload(_ context.Context, parentID, sourcePath string) (Item, error) {
+	documentID, err := validateRMDOC(sourcePath)
+	if err != nil {
+		return Item{}, err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.uploads = append(c.uploads, uploadCall{ParentID: parentID, SourcePath: sourcePath})
+	if len(c.uploadErrors) > 0 {
+		err := c.uploadErrors[0]
+		c.uploadErrors = c.uploadErrors[1:]
+		if err != nil {
+			return Item{}, err
+		}
+	}
+	name := strings.TrimSuffix(filepath.Base(sourcePath), ".rmdoc")
+	item := Item{ID: documentID, Name: name, ParentID: parentID, Kind: ItemDocument, Version: 1}
+	if c.items == nil {
+		c.items = make(map[string]Item)
+	}
+	c.items[item.ID] = item
+	return item, nil
 }
 func (c *fakeClient) Move(_ context.Context, id, parentID, name string) (Item, error) {
 	c.mu.Lock()

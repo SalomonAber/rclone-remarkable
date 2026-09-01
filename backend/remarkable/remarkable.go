@@ -11,12 +11,14 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
+	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/hash"
 )
 
@@ -66,12 +68,15 @@ type Options struct {
 
 // Fs represents a remarkable document tree.
 type Fs struct {
-	name     string
-	root     string
-	rootID   string
-	features *fs.Features
-	client   Client
-	cache    *contentCache
+	name          string
+	root          string
+	rootID        string
+	rootMissing   bool
+	rootMu        sync.Mutex
+	features      *fs.Features
+	client        Client
+	cache         *contentCache
+	uploadTempDir string
 }
 
 // NewFs constructs a filesystem backed by a configured rmapi sync 1.5 client.
@@ -112,22 +117,36 @@ func normalizeConnectionHost(host, root string) (string, string) {
 }
 
 func newFs(ctx context.Context, name, root string, client Client, cacheDir string) (*Fs, error) {
-	f := &Fs{name: name, root: strings.Trim(root, "/"), client: client}
+	f := &Fs{
+		name:          name,
+		root:          strings.Trim(root, "/"),
+		client:        client,
+		uploadTempDir: filepath.Join(cacheDir, ".uploads"),
+	}
+	var rootErr error
 	if client != nil {
 		f.cache = newContentCache(cacheDir, client)
 		rootItem, err := f.resolve(ctx, "", f.root)
-		if err != nil {
+		if errors.Is(err, fs.ErrorObjectNotFound) {
+			f.rootMissing = true
+		} else if err != nil {
 			return nil, err
+		} else if rootItem.Kind != ItemDirectory {
+			parentRoot := path.Dir(f.root)
+			if parentRoot == "." {
+				parentRoot = ""
+			}
+			f.root = parentRoot
+			f.rootID = rootItem.ParentID
+			rootErr = fs.ErrorIsFile
+		} else {
+			f.rootID = rootItem.ID
 		}
-		if rootItem.Kind != ItemDirectory {
-			return nil, fs.ErrorIsFile
-		}
-		f.rootID = rootItem.ID
 	}
 	f.features = (&fs.Features{
 		CanHaveEmptyDirectories: true,
 	}).Fill(ctx, f)
-	return f, nil
+	return f, rootErr
 }
 
 func (f *Fs) Name() string             { return f.name }
@@ -140,6 +159,9 @@ func (f *Fs) Features() *fs.Features   { return f.features }
 func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
 	if f.client == nil {
 		return nil, errClientUnavailable
+	}
+	if err := f.ensureRoot(ctx, false); err != nil {
+		return nil, err
 	}
 	directory, err := f.resolve(ctx, f.rootID, dir)
 	if err != nil {
@@ -179,6 +201,9 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	if f.client == nil {
 		return nil, errClientUnavailable
 	}
+	if err := f.ensureRoot(ctx, false); err != nil {
+		return nil, fs.ErrorObjectNotFound
+	}
 	item, err := f.resolve(ctx, f.rootID, remote)
 	if errors.Is(err, fs.ErrorObjectNotFound) {
 		return nil, fs.ErrorObjectNotFound
@@ -192,8 +217,46 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	return f.newObject(ctx, remote, item)
 }
 
-func (f *Fs) Put(context.Context, io.Reader, fs.ObjectInfo, ...fs.OpenOption) (fs.Object, error) {
-	return nil, fs.ErrorNotImplemented
+func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, _ ...fs.OpenOption) (fs.Object, error) {
+	if f.client == nil {
+		return nil, errClientUnavailable
+	}
+	if err := f.ensureRoot(ctx, true); err != nil {
+		return nil, err
+	}
+	parentID, visibleName, err := f.destination(ctx, src.Remote(), ItemDocument, "")
+	if err != nil {
+		if errors.Is(err, errDestinationExists) {
+			return nil, fserrors.NoRetryError(err)
+		}
+		return nil, err
+	}
+	stagedPath, _, documentID, err := stageRMDOC(ctx, in, f.uploadTempDir, visibleName)
+	if err != nil {
+		if errors.Is(err, errInvalidRMDOC) {
+			return nil, fserrors.NoRetryError(err)
+		}
+		return nil, err
+	}
+	defer removeStagedRMDOC(stagedPath)
+	if existing, err := f.client.Get(ctx, documentID); err == nil {
+		return nil, fserrors.NoRetryError(fmt.Errorf("%w: UUID %q is already visible as %q", errDestinationExists, documentID, localName(existing)))
+	} else if !errors.Is(err, errItemNotFound) {
+		return nil, err
+	}
+
+	item, err := f.client.Upload(ctx, parentID, stagedPath)
+	if err != nil {
+		return nil, fmt.Errorf("upload rmdoc: %w", err)
+	}
+	if item.ID != documentID {
+		return nil, fmt.Errorf("uploaded UUID %q does not match source UUID %q", item.ID, documentID)
+	}
+	item.Name = visibleName
+	item.ParentID = parentID
+	// rmapi normalizes archive metadata while importing, so the size of the
+	// newly synthesized remote .rmdoc is unknown until it is materialized.
+	return &Object{fs: f, remote: src.Remote(), item: item, size: -1}, nil
 }
 
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
@@ -201,7 +264,10 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 		return errClientUnavailable
 	}
 	if dir == "" {
-		return nil
+		return f.ensureRoot(ctx, true)
+	}
+	if err := f.ensureRoot(ctx, true); err != nil {
+		return err
 	}
 	parentID, name, err := f.destination(ctx, dir, ItemDirectory, "")
 	if errors.Is(err, errDestinationExists) {
@@ -222,7 +288,10 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	if f.client == nil {
 		return errClientUnavailable
 	}
-	if dir == "" {
+	if err := f.ensureRoot(ctx, false); err != nil {
+		return err
+	}
+	if dir == "" && f.root == "" {
 		return fs.ErrorPermissionDenied
 	}
 	item, err := f.resolve(ctx, f.rootID, dir)
@@ -243,6 +312,42 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 		return fs.ErrorDirectoryNotEmpty
 	}
 	return f.client.Remove(ctx, item.ID)
+}
+
+func (f *Fs) ensureRoot(ctx context.Context, create bool) error {
+	f.rootMu.Lock()
+	defer f.rootMu.Unlock()
+	if !f.rootMissing {
+		return nil
+	}
+	current := Item{Kind: ItemDirectory}
+	for _, component := range strings.Split(f.root, "/") {
+		items, err := f.client.List(ctx, current.ID)
+		if err != nil {
+			return err
+		}
+		found := false
+		for _, item := range items {
+			if item.Kind == ItemDirectory && item.Name == component {
+				current = item
+				found = true
+				break
+			}
+		}
+		if found {
+			continue
+		}
+		if !create {
+			return fs.ErrorDirNotFound
+		}
+		current, err = f.client.Mkdir(ctx, current.ID, component)
+		if err != nil {
+			return err
+		}
+	}
+	f.rootID = current.ID
+	f.rootMissing = false
+	return nil
 }
 
 // Move renames or moves an object by mutating metadata on its existing UUID.

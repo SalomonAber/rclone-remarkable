@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/rclone/rclone/fs"
+	fsobject "github.com/rclone/rclone/fs/object"
 )
 
 func TestRMFakecloudIntegration(t *testing.T) {
@@ -62,20 +63,31 @@ func TestRMFakecloudIntegration(t *testing.T) {
 		}
 	}()
 
-	rmapiClient, ok := client.(*rmapiClient)
-	if !ok {
-		t.Fatal("configured client is not rmapi-backed")
-	}
 	documentPath := filepath.Join(t.TempDir(), "controlled.rmdoc")
-	if err := os.WriteFile(documentPath, rmdocArchive(t, "controlled"), 0o600); err != nil {
+	const documentID = "865ee31e-5b86-47cd-a850-f2b2ec1af72d"
+	if err := os.WriteFile(documentPath, validRMDOC(t, documentID, 1024), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	document, err := rmapiClient.api.UploadDocument(folder.ID, documentPath, true, nil, nil, nil, nil)
+	documentFile, err := os.Open(documentPath)
 	if err != nil {
-		t.Fatalf("upload controlled rmdoc: %v", err)
+		t.Fatal(err)
 	}
-	if _, _, err := rmapiClient.api.Refresh(); err != nil {
-		t.Fatalf("refresh after upload: %v", err)
+	documentInfo, err := documentFile.Stat()
+	if err != nil {
+		_ = documentFile.Close()
+		t.Fatal(err)
+	}
+	source := fsobject.NewStaticObjectInfo(folderName+"/controlled.rmdoc", time.Now(), documentInfo.Size(), true, nil, backend)
+	uploaded, err := backend.Put(ctx, documentFile, source)
+	closeErr := documentFile.Close()
+	if err != nil {
+		t.Fatalf("Put controlled rmdoc: %v", err)
+	}
+	if closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if uploaded.(*Object).item.ID != documentID {
+		t.Fatalf("Put UUID = %q, want %q", uploaded.(*Object).item.ID, documentID)
 	}
 	entries, err := backend.List(ctx, folderName)
 	if err != nil {
@@ -87,8 +99,8 @@ func TestRMFakecloudIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("find uploaded rmdoc: %v", err)
 	}
-	if object.(*Object).item.ID != document.ID {
-		t.Fatalf("uploaded UUID = %q, want %q", object.(*Object).item.ID, document.ID)
+	if object.(*Object).item.ID != documentID {
+		t.Fatalf("uploaded UUID = %q, want %q", object.(*Object).item.ID, documentID)
 	}
 	if _, err := backend.Move(ctx, object, folderName+"/renamed.rmdoc"); err != nil {
 		t.Fatalf("rename rmdoc: %v", err)
@@ -97,7 +109,7 @@ func TestRMFakecloudIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("find renamed rmdoc: %v", err)
 	}
-	if renamed.(*Object).item.ID != document.ID {
+	if renamed.(*Object).item.ID != documentID {
 		t.Fatalf("rename changed UUID to %q", renamed.(*Object).item.ID)
 	}
 
@@ -111,7 +123,7 @@ func TestRMFakecloudIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("move rmdoc: %v", err)
 	}
-	if moved.(*Object).item.ID != document.ID {
+	if moved.(*Object).item.ID != documentID {
 		t.Fatalf("move changed UUID to %q", moved.(*Object).item.ID)
 	}
 	reader, err := moved.Open(ctx)
@@ -119,7 +131,7 @@ func TestRMFakecloudIntegration(t *testing.T) {
 		t.Fatalf("materialize rmdoc: %v", err)
 	}
 	_, readErr := io.ReadAll(reader)
-	closeErr := reader.Close()
+	closeErr = reader.Close()
 	if readErr != nil || closeErr != nil {
 		t.Fatalf("read materialized rmdoc: read=%v close=%v", readErr, closeErr)
 	}

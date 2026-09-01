@@ -1,6 +1,6 @@
 # rclone-remarkable
 
-An out-of-tree rclone backend named `remarkable`. The current model exposes reMarkable collections as directories and documents as raw ZIP-compatible `.rmdoc` objects. Metadata mutations are supported, but arbitrary `.rmdoc` writes remain unsupported.
+An out-of-tree rclone backend named `remarkable`. The current model exposes reMarkable collections as directories and documents as raw ZIP-compatible `.rmdoc` objects. New `.rmdoc` imports and metadata mutations are supported; editing or replacing an existing compound document is not.
 
 ## Architecture
 
@@ -13,7 +13,7 @@ Rclone v1.75.0 defines the mandatory contracts in `fs/types.go`:
 - `fs.Mover` optionally adds `Move(context.Context, fs.Object, string) (fs.Object, error)`.
 - `fs.DirMover` optionally adds `DirMove(context.Context, fs.Fs, string, string) error`.
 
-Optional interfaces are detected by `fs.Features.Fill`. The backend advertises `fs.Mover` and `fs.DirMover`; uploads remain unsupported.
+Optional interfaces are detected by `fs.Features.Fill`. The backend advertises `fs.Mover` and `fs.DirMover` and implements create-only `Put`.
 
 ### Read-only mapping
 
@@ -46,6 +46,16 @@ Mutations resolve source entries and destination parents to UUIDs before calling
 | `fs.DirMover.DirMove` | the same single `MoveEntry` call for the existing collection UUID |
 
 The rmapi adapter updates its in-memory file tree immediately after successful create, move, and delete calls. Rename and move never download, delete, recreate, or upload document content. Existing raw cache entries remain available by UUID and version.
+
+### `.rmdoc` creation
+
+`Put` supports creating a new document at an absent `.rmdoc` path. Incoming data is streamed to a private temporary file below `<cache-dir>/remarkable/.uploads`; it is never buffered as one in-memory object. Before any remote call, the backend reads every ZIP member to verify structure and CRCs, rejects unsafe paths, and requires exactly one top-level UUID `.content` entry plus its matching `.metadata` entry. The embedded UUID must not already exist anywhere in the remote tree.
+
+After validation, one `ApiCtx.UploadDocument` call imports the archive. rmapi rewrites the imported metadata with the destination visible name and parent, uploads component blobs, and publishes the document through the sync root. Failed validation, path/UUID collisions, and unsupported overwrite attempts are marked non-retryable; transport/API failures remain retryable.
+
+rmapi normalizes imported archives, so a later downloaded `.rmdoc` is semantically equivalent but not byte-for-byte identical and may have a different ZIP size. The object returned directly from `Put` therefore reports unknown size (`-1`); a subsequent listing materializes the published representation and reports its actual size.
+
+`Object.Update` deliberately rejects replacement. rmapi's `ReplaceDocumentFile` replaces one contained PDF/EPUB-style payload and does not safely replace an entire compound `.rmdoc`, so the backend does not pretend that POSIX editing semantics exist.
 
 ## rmapi findings
 
@@ -113,23 +123,24 @@ RCLONE_REMARKABLE_REFRESH_INTERVAL=30s \
 	:remarkable,host=http://127.0.0.1:7632: \
 	/tmp/remarkable \
 	--vfs-cache-mode full \
+	--vfs-write-back 0s \
 	--cache-dir /tmp/rclone-remarkable-cache \
 	--dir-cache-time 30s \
 	--poll-interval 0 \
 	--attr-timeout 1s
 ```
 
-Use an absolute persistent `--cache-dir` for normal operation. `full` mode gives editors and other POSIX applications stable local seek/read behavior. Polling is disabled because this backend does not implement rclone's change-notify interface; instead, `refresh_interval` bounds rmapi metadata refreshes during listings. Keep `--dir-cache-time` near that interval. Successful mutations update rmapi's in-process tree immediately, so they do not wait for either interval.
+Use an absolute persistent `--cache-dir` for normal operation. `full` mode gives editors and other POSIX applications stable local seek/read behavior; `--vfs-write-back 0s` starts remote creation as soon as a new file closes. Polling is disabled because this backend does not implement rclone's change-notify interface; instead, `refresh_interval` bounds rmapi metadata refreshes during listings. Keep `--dir-cache-time` near that interval. Successful mutations update rmapi's in-process tree immediately, so they do not wait for either interval.
 
 The backend content cache remains keyed by UUID and remote version beneath `<cache-dir>/remarkable`. Metadata-only file moves atomically derive the new version from the cached `.rmdoc` and rewrite its embedded metadata, avoiding a remote content download. The VFS cache is a separate rclone-managed layer. Testing confirmed repeated stats, copy-out, and eight concurrent opens reused one VFS entry; unmount left valid ZIP archives and no `.materializing-*` or `.promoting-*` files.
 
-Arbitrary file creation and writes through the mount remain unsupported because `Put`/`Update` are intentionally not implemented. Directory creation and metadata-only rename, move, and removal are supported.
+Copying a valid new `.rmdoc` into the mount is supported. Opening an existing remote object for write, truncating it, or copying over it is rejected. With full VFS caching, writeback happens asynchronously, so scripts that must synchronously observe upload errors should prefer `rclone copyto`; mount writeback failures are retained by VFS and logged.
 
 ## Compatibility Notes
 
 - rmapi's endpoint URLs are package-global values. The backend sets them from `host` before constructing its client, so different `remarkable` hosts are not safe to use simultaneously in one rclone process.
 - Rclone connection strings use `:` to separate options from the remote path, which normally splits an unescaped `http://host:port` value. The backend recognizes and repairs the resulting parsed form for HTTP/HTTPS hosts with numeric ports, so the short command examples above work as written. Standard configured remotes and escaped connection strings do not need this compatibility path.
-- rmapi persists its sync tree separately in the OS cache directory (`rmapi/tree.cache`), outside rclone's `--cache-dir`. The client refreshes that tree during construction and after the integration test's direct upload setup.
+- rmapi persists its sync tree separately in the OS cache directory (`rmapi/tree.cache`), outside rclone's `--cache-dir`. The client refreshes that tree during construction and periodically while listing.
 - rmfakecloud supports the sync 1.5/v3/v4 routes used by current rmapi. Its deployment must issue a valid sync 1.5 user token and configure a storage URL reachable by the client; newer reMarkable software has additional HTTPS/no-port restrictions documented by rmfakecloud.
 
 ## Development

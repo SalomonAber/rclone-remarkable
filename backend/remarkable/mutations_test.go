@@ -244,6 +244,46 @@ func TestRmdirSafetyAndMkdir(t *testing.T) {
 	}
 }
 
+func TestMkdirCreatesMissingConfiguredRoot(t *testing.T) {
+	ctx := context.Background()
+	client := &fakeClient{items: map[string]Item{}}
+	backend, err := newFs(ctx, "test", "Parent/Work", client, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !backend.rootMissing {
+		t.Fatal("missing root was not retained for creation")
+	}
+	if err := backend.Mkdir(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if backend.rootMissing || backend.rootID == "" {
+		t.Fatalf("root not created: missing=%t id=%q", backend.rootMissing, backend.rootID)
+	}
+	_, mkdirs, _ := client.operations()
+	if len(mkdirs) != 2 || mkdirs[0].Name != "Parent" || mkdirs[1].Name != "Work" {
+		t.Fatalf("root mkdir calls = %#v", mkdirs)
+	}
+}
+
+func TestRmdirRemovesConfiguredRoot(t *testing.T) {
+	ctx := context.Background()
+	client := &fakeClient{items: map[string]Item{
+		"work": {ID: "work", Name: "Work", Kind: ItemDirectory},
+	}}
+	backend, err := newFs(ctx, "test", "Work", client, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.Rmdir(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	_, _, removes := client.operations()
+	if len(removes) != 1 || removes[0] != "work" {
+		t.Fatalf("configured root removes = %#v", removes)
+	}
+}
+
 func mutationClient(t *testing.T) *fakeClient {
 	t.Helper()
 	return &fakeClient{

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/hash"
 )
 
@@ -68,7 +69,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	return file, nil
 }
 func (o *Object) Update(context.Context, io.Reader, fs.ObjectInfo, ...fs.OpenOption) error {
-	return fs.ErrorNotImplemented
+	return fserrors.NoRetryError(fmt.Errorf("%w: replacing an existing compound .rmdoc is not supported", fs.ErrorNotImplemented))
 }
 func (o *Object) Remove(ctx context.Context) error {
 	return o.fs.client.Remove(ctx, o.item.ID)

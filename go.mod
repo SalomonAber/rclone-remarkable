@@ -3,6 +3,7 @@ module github.com/poplicola/rclone-remarkable
 go 1.25.0
 
 require (
+	github.com/google/uuid v1.6.0
 	github.com/juruen/rmapi v0.0.0-20260430190040-2bcde75bf543
 	github.com/rclone/rclone v1.75.0
 	golang.org/x/sync v0.22.0
@@ -41,11 +42,11 @@ require (
 	github.com/gdamore/encoding v1.0.1 // indirect
 	github.com/gdamore/tcell/v2 v2.9.0 // indirect
 	github.com/go-chi/chi/v5 v5.3.1 // indirect
+	github.com/go-darwin/apfs v0.0.0-20211011131704-f84b94dbf348 // indirect
 	github.com/go-git/go-billy/v5 v5.9.0 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
 	github.com/golang-jwt/jwt v3.2.2+incompatible // indirect
 	github.com/golang/freetype v0.0.0-20170609003504-e2365dfdc4a0 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/gopherjs/gopherjs v1.21.0 // indirect
 	github.com/hanwen/go-fuse/v2 v2.10.1 // indirect
 	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
@@ -77,6 +78,7 @@ require (
 	github.com/peterh/liner v1.2.2 // indirect
 	github.com/pierrec/lz4/v4 v4.1.27 // indirect
 	github.com/pkg/sftp v1.13.11 // indirect
+	github.com/pkg/xattr v0.4.12 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55 // indirect
 	github.com/prometheus/client_golang v1.23.2 // indirect

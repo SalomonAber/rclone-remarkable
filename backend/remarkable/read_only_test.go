@@ -89,6 +89,17 @@ func TestRootResolution(t *testing.T) {
 	assertEntry(t, entries, "Design.rmdoc", false)
 }
 
+func TestFileRootReturnsParentFs(t *testing.T) {
+	ctx := context.Background()
+	backend, err := newFs(ctx, "test", "Work/Meeting Notes.rmdoc", treeClient(t), t.TempDir())
+	if !errors.Is(err, fs.ErrorIsFile) {
+		t.Fatalf("NewFs error = %v", err)
+	}
+	if backend == nil || backend.Root() != "Work" || backend.rootID != "work" {
+		t.Fatalf("parent Fs = %#v", backend)
+	}
+}
+
 func TestRMDOCSuffixHandling(t *testing.T) {
 	ctx := context.Background()
 	client := &fakeClient{
