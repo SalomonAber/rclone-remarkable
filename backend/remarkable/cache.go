@@ -25,15 +25,19 @@ func newContentCache(dir string, client Client) *contentCache {
 	return &contentCache{dir: dir, client: client}
 }
 
-func (c *contentCache) path(id string, version int) (string, error) {
-	if id == "" || id == "." || filepath.Base(id) != id {
-		return "", fmt.Errorf("invalid document UUID %q", id)
+func (c *contentCache) path(item Item) (string, error) {
+	if item.ID == "" || item.ID == "." || filepath.Base(item.ID) != item.ID {
+		return "", fmt.Errorf("invalid document UUID %q", item.ID)
 	}
-	return filepath.Join(c.dir, id, strconv.Itoa(version)+".rmdoc"), nil
+	name := strconv.Itoa(item.Version)
+	if !item.ModTime.IsZero() {
+		name += "-" + strconv.FormatInt(item.ModTime.UnixNano(), 10)
+	}
+	return filepath.Join(c.dir, item.ID, name+".rmdoc"), nil
 }
 
 func (c *contentCache) materialize(ctx context.Context, item Item) (string, os.FileInfo, error) {
-	cachePath, err := c.path(item.ID, item.Version)
+	cachePath, err := c.path(item)
 	if err != nil {
 		return "", nil, err
 	}
@@ -84,11 +88,11 @@ func (c *contentCache) materialize(ctx context.Context, item Item) (string, os.F
 }
 
 func (c *contentCache) promoteMetadata(oldItem, newItem Item) (os.FileInfo, bool, error) {
-	oldPath, err := c.path(oldItem.ID, oldItem.Version)
+	oldPath, err := c.path(oldItem)
 	if err != nil {
 		return nil, false, err
 	}
-	newPath, err := c.path(newItem.ID, newItem.Version)
+	newPath, err := c.path(newItem)
 	if err != nil {
 		return nil, false, err
 	}

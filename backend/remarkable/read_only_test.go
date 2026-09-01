@@ -207,6 +207,45 @@ func TestVersionSpecificCache(t *testing.T) {
 	}
 }
 
+func TestModificationTimeSpecificCache(t *testing.T) {
+	ctx := context.Background()
+	client := &fakeClient{
+		contents: map[string][]byte{"doc": []byte("original content")},
+	}
+	cacheDir := t.TempDir()
+	cache := newContentCache(cacheDir, client)
+	original := Item{
+		ID:      "doc",
+		Version: 1,
+		ModTime: time.Date(2026, time.September, 1, 8, 30, 0, 123_000_000, time.UTC),
+	}
+	pathOriginal, _, err := cache.materialize(ctx, original)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client.contents["doc"] = []byte("edited content")
+	edited := original
+	edited.ModTime = edited.ModTime.Add(time.Second)
+	pathEdited, _, err := cache.materialize(ctx, edited)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pathEdited == pathOriginal {
+		t.Fatalf("modified document reused cache path %q", pathEdited)
+	}
+	if calls := client.downloadCount("doc"); calls != 2 {
+		t.Fatalf("modification time change downloads = %d, want 2", calls)
+	}
+	content, err := os.ReadFile(pathEdited)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "edited content" {
+		t.Fatalf("modified document content = %q", content)
+	}
+}
+
 func TestConcurrentOpensDeduplicateMaterialization(t *testing.T) {
 	ctx := context.Background()
 	client := &fakeClient{
@@ -237,7 +276,7 @@ func TestConcurrentOpensDeduplicateMaterialization(t *testing.T) {
 		}()
 	}
 	<-client.downloadStarted
-	finalPath, err := cache.path("doc", 9)
+	finalPath, err := cache.path(Item{ID: "doc", Version: 9})
 	if err != nil {
 		t.Fatal(err)
 	}
