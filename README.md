@@ -173,10 +173,25 @@ The backend accepts these options:
 | --- | --- |
 | `host` | API base URL. Defaults to `RMAPI_HOST`, then `http://127.0.0.1:7632`. |
 | `config` | YAML credentials file with `devicetoken` and `usertoken`. Defaults to `RMAPI_CONFIG`. |
+| `client_cert` | PEM-encoded TLS client certificate for an mTLS endpoint. Requires `client_key`. |
+| `client_key` | PEM-encoded private key for `client_cert`. Requires `client_cert`. |
 | `device_token` | Overrides `devicetoken` from the config file. |
 | `user_token` | Overrides `usertoken` from the config file. |
 
 `usertoken` is required. This backend deliberately does not use rmapi's interactive token helper because it may terminate the process on configuration failures. Refresh an expired user token with rmapi or provide an updated YAML file/token.
+
+For an rmfakecloud endpoint requiring mutual TLS:
+
+```ini
+[remarkable]
+type = remarkable
+host = https://rmfakecloud.example
+config = /path/to/rmapi-config
+client_cert = /path/to/client.crt
+client_key = /path/to/client.key
+```
+
+Both client-certificate options must be set together. The backend loads the keypair into rmapi's private `http.Client`; this covers the initial tree mirror and all later sync, upload, and download requests without changing `http.DefaultTransport`. Standard server certificate and hostname verification remain enabled. rmapi exposes the client through `transport.HttpClientCtx.Client`, so no rmapi fork change is required for mTLS transport injection.
 
 With a compatible rmapi config already selected through `RMAPI_CONFIG`, use:
 

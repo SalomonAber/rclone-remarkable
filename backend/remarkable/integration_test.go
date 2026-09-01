@@ -37,6 +37,8 @@ func TestRMFakecloudIntegration(t *testing.T) {
 		Host:            host,
 		RefreshInterval: fs.Duration(time.Second),
 		Config:          configPath,
+		ClientCert:      os.Getenv("REMARKABLE_CLIENT_CERT"),
+		ClientKey:       os.Getenv("REMARKABLE_CLIENT_KEY"),
 		DeviceToken:     os.Getenv("REMARKABLE_DEVICE_TOKEN"),
 		UserToken:       os.Getenv("REMARKABLE_USER_TOKEN"),
 	}, filepath.Join(t.TempDir(), "rmapi-metadata"))

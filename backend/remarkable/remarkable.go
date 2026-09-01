@@ -44,6 +44,16 @@ func init() {
 			Help:     "Path to an rmapi YAML config containing devicetoken and usertoken.",
 			Advanced: true,
 		}, {
+			Name:      "client_cert",
+			Help:      "Path to a PEM-encoded TLS client certificate. Must be used with client_key.",
+			Advanced:  true,
+			Sensitive: true,
+		}, {
+			Name:      "client_key",
+			Help:      "Path to the PEM-encoded private key for client_cert. Must be used with client_cert.",
+			Advanced:  true,
+			Sensitive: true,
+		}, {
 			Name:      "device_token",
 			Help:      "rmapi device token. Overrides the config file value.",
 			Advanced:  true,
@@ -62,6 +72,8 @@ type Options struct {
 	Host            string      `config:"host"`
 	RefreshInterval fs.Duration `config:"refresh_interval"`
 	Config          string      `config:"config"`
+	ClientCert      string      `config:"client_cert"`
+	ClientKey       string      `config:"client_key"`
 	DeviceToken     string      `config:"device_token"`
 	UserToken       string      `config:"user_token"`
 }

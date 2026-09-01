@@ -3,9 +3,11 @@ package remarkable
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -75,6 +77,10 @@ func newRMAPIClient(api rmapi.ApiCtx, host string, refreshInterval time.Duration
 }
 
 func newConfiguredRMAPIClient(opt Options, metadataCacheRoot string) (Client, error) {
+	httpCtx, err := newRMAPIHTTPClientCtx(opt)
+	if err != nil {
+		return nil, err
+	}
 	tokens, err := rmapiTokens(opt)
 	if err != nil {
 		return nil, err
@@ -88,7 +94,7 @@ func newConfiguredRMAPIClient(opt Options, metadataCacheRoot string) (Client, er
 	// configured for its initial tree mirror, so apply it once here too.
 	rmapiHostMu.Lock()
 	configureRMAPIHost(opt.Host)
-	httpCtx := transport.CreateHttpClientCtx(tokens)
+	httpCtx.Tokens = tokens
 	metadataCacheDir := ""
 	if metadataCacheRoot != "" {
 		accountID := sha256.Sum256([]byte(opt.Host + "\x00" + tokens.UserToken))
@@ -104,6 +110,36 @@ func newConfiguredRMAPIClient(opt Options, metadataCacheRoot string) (Client, er
 		refreshInterval = 30 * time.Second
 	}
 	return newRMAPIClient(apiCtx, opt.Host, refreshInterval), nil
+}
+
+// newRMAPIHTTPClientCtx configures rmapi's private HTTP client.
+func newRMAPIHTTPClientCtx(opt Options) (transport.HttpClientCtx, error) {
+	if (opt.ClientCert == "") != (opt.ClientKey == "") {
+		return transport.HttpClientCtx{}, errors.New("remarkable: client_cert and client_key must be set together")
+	}
+
+	httpCtx := transport.CreateHttpClientCtx(model.AuthTokens{})
+	if opt.ClientCert == "" {
+		return httpCtx, nil
+	}
+
+	certificate, err := tls.LoadX509KeyPair(opt.ClientCert, opt.ClientKey)
+	if err != nil {
+		return transport.HttpClientCtx{}, errors.New("remarkable: unable to load client certificate/key")
+	}
+	defaultTransport, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return transport.HttpClientCtx{}, errors.New("remarkable: unable to configure client certificate transport")
+	}
+	transportConfig := defaultTransport.Clone()
+	if transportConfig.TLSClientConfig == nil {
+		transportConfig.TLSClientConfig = new(tls.Config)
+	} else {
+		transportConfig.TLSClientConfig = transportConfig.TLSClientConfig.Clone()
+	}
+	transportConfig.TLSClientConfig.Certificates = append(transportConfig.TLSClientConfig.Certificates, certificate)
+	httpCtx.Client.Transport = transportConfig
+	return httpCtx, nil
 }
 
 func rmapiTokens(opt Options) (model.AuthTokens, error) {
