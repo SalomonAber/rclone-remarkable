@@ -2,7 +2,9 @@ package remarkable
 
 import (
 	"context"
+	"fmt"
 	"io"
+	"sync"
 	"testing"
 	"time"
 
@@ -11,7 +13,12 @@ import (
 )
 
 type fakeClient struct {
-	items map[string]Item
+	mu              sync.Mutex
+	items           map[string]Item
+	contents        map[string][]byte
+	downloads       map[string]int
+	downloadStarted chan struct{}
+	releaseDownload chan struct{}
 }
 
 func (c *fakeClient) List(_ context.Context, parentID string) ([]Item, error) {
@@ -25,10 +32,42 @@ func (c *fakeClient) List(_ context.Context, parentID string) ([]Item, error) {
 }
 
 func (c *fakeClient) Get(_ context.Context, id string) (Item, error) {
-	return c.items[id], nil
+	item, ok := c.items[id]
+	if !ok {
+		return Item{}, fmt.Errorf("item %q not found", id)
+	}
+	return item, nil
 }
 
-func (c *fakeClient) Download(context.Context, string, io.Writer) error { return nil }
+func (c *fakeClient) Download(ctx context.Context, id string, dst io.Writer) error {
+	c.mu.Lock()
+	if c.downloads == nil {
+		c.downloads = make(map[string]int)
+	}
+	c.downloads[id]++
+	content, ok := c.contents[id]
+	started := c.downloadStarted
+	release := c.releaseDownload
+	c.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("content %q not found", id)
+	}
+	if started != nil {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+	}
+	if release != nil {
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	_, err := dst.Write(content)
+	return err
+}
 func (c *fakeClient) Move(context.Context, string, string, string) (Item, error) {
 	return Item{}, nil
 }
@@ -36,6 +75,12 @@ func (c *fakeClient) Mkdir(context.Context, string, string) (Item, error) {
 	return Item{}, nil
 }
 func (c *fakeClient) Remove(context.Context, string) error { return nil }
+
+func (c *fakeClient) downloadCount(id string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.downloads[id]
+}
 
 var _ Client = (*fakeClient)(nil)
 

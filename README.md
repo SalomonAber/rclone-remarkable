@@ -1,6 +1,6 @@
 # rclone-remarkable
 
-Stage 1 scaffold for an out-of-tree rclone backend named `remarkable`. The eventual backend will expose the reMarkable document tree as directories and each document as its raw ZIP-compatible `.rmdoc` archive. No filesystem operations or live cloud connection are implemented yet.
+An out-of-tree rclone backend named `remarkable`. The current read-only model exposes reMarkable collections as directories and documents as raw ZIP-compatible `.rmdoc` objects. Live rmfakecloud client construction is not wired yet; the read model is exercised against the fake client.
 
 ## Architecture
 
@@ -13,7 +13,25 @@ Rclone v1.75.0 defines the mandatory contracts in `fs/types.go`:
 - `fs.Mover` optionally adds `Move(context.Context, fs.Object, string) (fs.Object, error)`.
 - `fs.DirMover` optionally adds `DirMove(context.Context, fs.Fs, string, string) error`.
 
-Optional interfaces are detected by `fs.Features.Fill`. Move interfaces are not advertised in this stage because their filesystem behavior is not implemented.
+Optional interfaces are detected by `fs.Features.Fill`. Move interfaces are not advertised because the backend remains read-only.
+
+### Read-only mapping
+
+Paths are resolved one collection at a time through parent UUIDs. A collection's visible name is presented unchanged, while a document's visible name gains a local `.rmdoc` suffix. The suffix is never sent to reMarkable. `Object` retains the document `Item`, including UUID and version, separately from its rclone presentation path, so a later rename or move does not change identity.
+
+Sibling entries are checked after applying the local naming rule. If two UUIDs produce the same local name, listing and path resolution return an explicit ambiguity error rather than selecting one.
+
+`List` and `NewObject` materialize document content before returning an object, giving rclone a correct synthesized archive size. `Open` supports rclone range and seek options by opening and seeking the completed local cache file.
+
+### Content cache
+
+Raw archives are persisted below rclone's configured cache directory:
+
+```text
+remarkable/<document UUID>/<remote version>.rmdoc
+```
+
+Downloads go to a temporary file in the destination directory, are flushed and closed, and are then atomically renamed into place. A process-wide singleflight group keyed by the final cache path ensures simultaneous requests for the same UUID and version share one download. Different versions use different paths; stale versions are retained.
 
 ## rmapi findings
 
@@ -34,7 +52,7 @@ The relevant library surface is the sync 1.5 `api.ApiCtx` and its `filetree`/`mo
 | mkdir | `ApiCtx.CreateDir(parentID, name, notify)` |
 | delete | `ApiCtx.DeleteEntry(node, recursive, notify)` removes the entry from the sync tree |
 
-rmapi also creates a synthetic `trash` collection in its file tree. Stage 1 does not choose user-visible trash semantics; that belongs with real filesystem behavior.
+rmapi also creates a synthetic `trash` collection in its file tree. The read-only stage does not choose mutation or trash semantics.
 
 `backend/remarkable/api.go` isolates this dependency behind a small `Client` using backend-owned `Item` values. The adapter handles rmapi's path-based `FetchDocument` through a temporary `.rmdoc` file, while callers use an `io.Writer`. Authentication and construction of a live `api.ApiCtx` remain deliberately unwired.
 
@@ -44,6 +62,7 @@ rmapi also creates a synthetic `trash` collection in its file tree. Stage 1 does
 nix develop
 go build ./...
 go test ./...
+go vet ./...
 go build -o rclone-remarkable .
 ./rclone-remarkable help backends
 ```

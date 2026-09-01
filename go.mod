@@ -5,6 +5,7 @@ go 1.25.0
 require (
 	github.com/juruen/rmapi v0.0.0-20260430190040-2bcde75bf543
 	github.com/rclone/rclone v1.75.0
+	golang.org/x/sync v0.22.0
 )
 
 require (
@@ -117,7 +118,6 @@ require (
 	golang.org/x/exp v0.0.0-20260709172345-9ea1abe57597 // indirect
 	golang.org/x/image v0.44.0 // indirect
 	golang.org/x/net v0.57.0 // indirect
-	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/term v0.45.0 // indirect
 	golang.org/x/text v0.40.0 // indirect
