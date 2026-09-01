@@ -2,6 +2,89 @@
 
 An out-of-tree rclone backend named `remarkable`. The current model exposes reMarkable collections as directories and documents as raw ZIP-compatible `.rmdoc` objects. New `.rmdoc` imports and metadata mutations are supported; editing or replacing an existing compound document is not.
 
+## NixOS Quick Start
+
+You need a running rmfakecloud instance and an rmapi YAML file containing `devicetoken` and `usertoken`. Keep that file encrypted with agenix; only its runtime path is referenced by the Nix configuration.
+
+1. Add this repository to your flake inputs and import its NixOS module:
+
+	```nix
+	{
+	  inputs.agenix.url = "github:ryantm/agenix";
+	  inputs.rclone-remarkable.url = "github:SalomonAber/rclone-remarkable";
+
+	  outputs = inputs@{ nixpkgs, ... }: {
+	    nixosConfigurations.your-host = nixpkgs.lib.nixosSystem {
+	      system = "x86_64-linux";
+	      modules = [
+	        inputs.agenix.nixosModules.default
+	        inputs.rclone-remarkable.nixosModules.default
+	        ./configuration.nix
+	      ];
+	    };
+	  };
+	}
+	```
+
+2. Add the mount to `configuration.nix`:
+
+	```nix
+	{ config, ... }:
+	{
+	  age.secrets.rmapi-config = {
+	    file = ./secrets/rmapi-config.age;
+	    owner = "root";
+	    group = "root";
+	    mode = "0400";
+	  };
+
+	  environment.etc."rclone-remarkable.conf".text = ''
+	    [remarkable]
+	    type = remarkable
+	    host = https://rmfakecloud.example.com
+	    config = ${config.age.secrets.rmapi-config.path}
+	    refresh_interval = 30s
+	  '';
+
+	  programs.fuse.userAllowOther = true;
+
+	  systemd.tmpfiles.rules = [
+	    "d /var/cache/rclone/remarkable 0750 root root -"
+	  ];
+
+	  fileSystems."/mnt/remarkable" = {
+	    device = "remarkable:";
+	    fsType = "rclone";
+	    options = [
+	      "nodev"
+	      "nofail"
+	      "_netdev"
+	      "allow_other"
+	      "args2env"
+	      "config=/etc/rclone-remarkable.conf"
+	      "cache_dir=/var/cache/rclone/remarkable"
+	      "vfs_cache_mode=full"
+	      "vfs_write_back=0s"
+	      "dir_cache_time=30s"
+	      "poll_interval=0"
+	      "attr_timeout=1s"
+	    ];
+	  };
+	}
+	```
+
+	Replace the host URL and agenix secret path for your system. If rmfakecloud runs as a local service, add `x-systemd.requires=rmfakecloud.service` and `x-systemd.after=rmfakecloud.service` to the mount options.
+
+3. Rebuild and verify:
+
+	```sh
+	sudo nixos-rebuild switch --flake .#your-host
+	mount | grep remarkable
+	ls /mnt/remarkable
+	```
+
+The imported module installs this project's `mount.rclone` through `system.fsPackages`, so the normal NixOS `fileSystems` integration uses the custom backend without a hand-written systemd service. Existing `.rmdoc` files can be read, renamed, moved, and removed. Copying a new valid `.rmdoc` into the mount imports one reMarkable document; overwriting an existing document is intentionally rejected.
+
 ## Architecture
 
 The custom binary follows rclone's official out-of-tree pattern: `rclone.go` imports rclone's commands and blank-imports `backend/remarkable`, whose `init` function calls `fs.Register`. It intentionally does not import `backend/all`, keeping the binary limited to this backend.
@@ -143,7 +226,7 @@ Copying a valid new `.rmdoc` into the mount is supported. Opening an existing re
 - rmapi persists its sync tree separately in the OS cache directory (`rmapi/tree.cache`), outside rclone's `--cache-dir`. The client refreshes that tree during construction and periodically while listing.
 - rmfakecloud supports the sync 1.5/v3/v4 routes used by current rmapi. Its deployment must issue a valid sync 1.5 user token and configure a storage URL reachable by the client; newer reMarkable software has additional HTTPS/no-port restrictions documented by rmfakecloud.
 
-## NixOS
+## NixOS Packaging Details
 
 The flake's default package builds the custom binary and provides `rclone`, `rclone-remarkable`, `rclonefs`, and `mount.rclone`. The last two are symlinks to the wrapped custom binary, matching nixpkgs' stock rclone package. The wrapper adds FUSE 3 utilities to its fallback PATH without shadowing NixOS's privileged `/run/wrappers/bin/fusermount3`.
 
@@ -151,7 +234,7 @@ Importing `nixosModules.default` adds the custom package to `system.fsPackages`.
 
 ```nix
 {
-	inputs.rclone-remarkable.url = "github:poplicola/rclone-remarkable";
+	inputs.rclone-remarkable.url = "github:SalomonAber/rclone-remarkable";
 
 	outputs = inputs@{ nixpkgs, rclone-remarkable, ... }: {
 		nixosConfigurations.host = nixpkgs.lib.nixosSystem {
