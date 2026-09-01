@@ -43,7 +43,7 @@ buildGoModule {
 
   meta = {
     description = "Custom rclone binary with the remarkable backend";
-    homepage = "https://github.com/poplicola/rclone-remarkable";
+    homepage = "https://github.com/salomonaber/rclone-remarkable";
     license = lib.licenses.mit;
     mainProgram = "rclone";
     platforms = lib.platforms.linux;
