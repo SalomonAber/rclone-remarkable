@@ -2,10 +2,12 @@ package remarkable
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +21,8 @@ import (
 )
 
 var errItemNotFound = errors.New("item not found")
+
+var createRMAPIContext = rmapi.CreateApiCtxWithOptions
 
 // Item is the backend's representation of a reMarkable tree entry.
 type Item struct {
@@ -70,7 +74,7 @@ func newRMAPIClient(api rmapi.ApiCtx, host string, refreshInterval time.Duration
 	return &rmapiClient{api: api, host: host, refreshInterval: refreshInterval, lastRefresh: time.Now()}
 }
 
-func newConfiguredRMAPIClient(opt Options) (Client, error) {
+func newConfiguredRMAPIClient(opt Options, metadataCacheRoot string) (Client, error) {
 	tokens, err := rmapiTokens(opt)
 	if err != nil {
 		return nil, err
@@ -85,7 +89,12 @@ func newConfiguredRMAPIClient(opt Options) (Client, error) {
 	rmapiHostMu.Lock()
 	configureRMAPIHost(opt.Host)
 	httpCtx := transport.CreateHttpClientCtx(tokens)
-	apiCtx, err := rmapi.CreateApiCtx(&httpCtx, rmapi.Version15)
+	metadataCacheDir := ""
+	if metadataCacheRoot != "" {
+		accountID := sha256.Sum256([]byte(opt.Host + "\x00" + tokens.UserToken))
+		metadataCacheDir = filepath.Join(metadataCacheRoot, fmt.Sprintf("%x", accountID))
+	}
+	apiCtx, err := createRMAPIContext(&httpCtx, rmapi.Version15, rmapi.Options{CacheDir: metadataCacheDir})
 	rmapiHostMu.Unlock()
 	if err != nil {
 		return nil, fmt.Errorf("remarkable: initialize rmapi sync client: %w", err)

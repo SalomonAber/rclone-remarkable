@@ -1,4 +1,4 @@
-module github.com/poplicola/rclone-remarkable
+module github.com/SalomonAber/rclone-remarkable
 
 go 1.25.0
 
@@ -132,4 +132,4 @@ require (
 	moul.io/http2curl/v2 v2.3.0 // indirect
 )
 
-replace github.com/juruen/rmapi => github.com/ddvk/rmapi v0.0.0-20260823171759-aa60dac8a8db
+replace github.com/juruen/rmapi => github.com/SalomonAber/rmapi v0.0.0-20260901125535-079db5cbc5e3

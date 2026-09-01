@@ -45,6 +45,8 @@ github.com/PuerkitoBio/goquery v1.12.0 h1:pAcL4g3WRXekcB9AU/y1mbKez2dbY2AajVhtkO
 github.com/PuerkitoBio/goquery v1.12.0/go.mod h1:802ej+gV2y7bbIhOIoPY5sT183ZW0YFofScC4q/hIpQ=
 github.com/STARRY-S/zip v0.2.3 h1:luE4dMvRPDOWQdeDdUxUoZkzUIpTccdKdhHHsQJ1fm4=
 github.com/STARRY-S/zip v0.2.3/go.mod h1:lqJ9JdeRipyOQJrYSOtpNAiaesFO6zVDsE8GIGFaoSk=
+github.com/SalomonAber/rmapi v0.0.0-20260901125535-079db5cbc5e3 h1:PPpOxX5j2DuLIm6DkS68ij+Vk+puAjP2ru4OAurJfY4=
+github.com/SalomonAber/rmapi v0.0.0-20260901125535-079db5cbc5e3/go.mod h1:2AkWw/FUrvTY+3qX5UGCCnNI38tiN4mcKWaCYQM7gqY=
 github.com/a1ex3/zstd-seekable-format-go/pkg v0.10.0 h1:iLDOF0rdGTrol/q8OfPIIs5kLD8XvA2q75o6Uq/tgak=
 github.com/a1ex3/zstd-seekable-format-go/pkg v0.10.0/go.mod h1:DrEWcQJjz7t5iF2duaiyhg4jyoF0kxOD6LtECNGkZ/Q=
 github.com/a8m/tree v0.0.0-20240104212747-2c8764a5f17e h1:KMVieI1/Ub++GYfnhyFPoGE3g5TUiG4srE3TMGr5nM4=
@@ -168,8 +170,6 @@ github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSs
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc h1:U9qPSI2PIWSS1VwoXQT9A3Wy9MM3WgvqSxFWenqJduM=
 github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
-github.com/ddvk/rmapi v0.0.0-20260823171759-aa60dac8a8db h1:eYdFySm5f31lS6zUYcCAb51TwVCpIl4Wek+6kXjwThM=
-github.com/ddvk/rmapi v0.0.0-20260823171759-aa60dac8a8db/go.mod h1:2AkWw/FUrvTY+3qX5UGCCnNI38tiN4mcKWaCYQM7gqY=
 github.com/diskfs/go-diskfs v1.9.4 h1:0j2d7eG4IjyxL6+ChWbDPocdBCF6HQ4HBWU2WDYWVnc=
 github.com/diskfs/go-diskfs v1.9.4/go.mod h1:TePJORO83Adh5pb2SqsxAwaP0fofFxKLkxctiS/9OQc=
 github.com/dromara/dongle v1.0.1 h1:si/7UP/EXxnFVZok1cNos70GiMGxInAYMilHQFP5dJs=

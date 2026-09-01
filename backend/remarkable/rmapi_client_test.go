@@ -2,6 +2,10 @@ package remarkable
 
 import (
 	"context"
+	"crypto/sha256"
+	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -9,6 +13,7 @@ import (
 	rmconfig "github.com/juruen/rmapi/config"
 	"github.com/juruen/rmapi/filetree"
 	"github.com/juruen/rmapi/model"
+	"github.com/juruen/rmapi/transport"
 )
 
 // fakeAPICtx implements rmapi.ApiCtx directly on top of a real
@@ -37,6 +42,84 @@ func (f *fakeAPICtx) Nuke() error                               { return nil }
 func (f *fakeAPICtx) Refresh() (string, int64, error)           { return "", 0, nil }
 
 var _ rmapi.ApiCtx = (*fakeAPICtx)(nil)
+
+func TestRMAPIExplicitCacheWithoutHome(t *testing.T) {
+	t.Setenv("HOME", "")
+	t.Setenv("XDG_CACHE_HOME", "")
+
+	rcloneCacheDir := t.TempDir()
+	metadataRoot := rmapiMetadataCacheRoot(rcloneCacheDir)
+	wantRoot := filepath.Join(rcloneCacheDir, "remarkable-metadata")
+	if metadataRoot != wantRoot {
+		t.Fatalf("metadata cache root = %q, want %q", metadataRoot, wantRoot)
+	}
+
+	originalCreate := createRMAPIContext
+	t.Cleanup(func() { createRMAPIContext = originalCreate })
+	var gotOptions rmapi.Options
+	createRMAPIContext = func(_ *transport.HttpClientCtx, _ rmapi.SyncVersion, options rmapi.Options) (rmapi.ApiCtx, error) {
+		gotOptions = options
+		tree := filetree.CreateFileTreeCtx()
+		return &fakeAPICtx{tree: &tree}, nil
+	}
+
+	opt := Options{Host: "https://cloud.example", UserToken: "test-user-token"}
+	if _, err := newConfiguredRMAPIClient(opt, metadataRoot); err != nil {
+		t.Fatalf("newConfiguredRMAPIClient without HOME/XDG_CACHE_HOME: %v", err)
+	}
+	accountID := sha256.Sum256([]byte(opt.Host + "\x00" + opt.UserToken))
+	wantCacheDir := filepath.Join(wantRoot, fmt.Sprintf("%x", accountID))
+	if gotOptions.CacheDir != wantCacheDir {
+		t.Fatalf("rmapi cache dir = %q, want %q", gotOptions.CacheDir, wantCacheDir)
+	}
+}
+
+func TestRMAPIUsesRcloneFallbackWithoutHome(t *testing.T) {
+	t.Setenv("HOME", "")
+	t.Setenv("XDG_CACHE_HOME", "")
+
+	rcloneFallback := filepath.Join(os.TempDir(), "rclone")
+	want := filepath.Join(rcloneFallback, "remarkable-metadata")
+	if got := rmapiMetadataCacheRoot(rcloneFallback); got != want {
+		t.Fatalf("fallback metadata cache root = %q, want %q", got, want)
+	}
+}
+
+func TestRMAPIExplicitCacheIsDeterministicAndAccountSeparated(t *testing.T) {
+	metadataRoot := rmapiMetadataCacheRoot(filepath.Join(t.TempDir(), "explicit-rclone-cache"))
+	first := sha256.Sum256([]byte("https://first.example\x00first-token"))
+	second := sha256.Sum256([]byte("https://second.example\x00second-token"))
+	firstPath := filepath.Join(metadataRoot, fmt.Sprintf("%x", first))
+	secondPath := filepath.Join(metadataRoot, fmt.Sprintf("%x", second))
+	if firstPath == secondPath || filepath.Dir(firstPath) != metadataRoot || filepath.Dir(secondPath) != metadataRoot {
+		t.Fatalf("account cache paths are not separated: %q and %q", firstPath, secondPath)
+	}
+}
+
+func TestRMAPIDefaultCachePreservesInteractiveBehavior(t *testing.T) {
+	xdgCacheHome := t.TempDir()
+	t.Setenv("XDG_CACHE_HOME", xdgCacheHome)
+	t.Setenv("HOME", t.TempDir())
+
+	if got := rmapiMetadataCacheRoot(filepath.Join(xdgCacheHome, "rclone")); got != "" {
+		t.Fatalf("default interactive metadata root = %q, want rmapi default", got)
+	}
+
+	originalCreate := createRMAPIContext
+	t.Cleanup(func() { createRMAPIContext = originalCreate })
+	var gotOptions rmapi.Options
+	createRMAPIContext = func(_ *transport.HttpClientCtx, _ rmapi.SyncVersion, options rmapi.Options) (rmapi.ApiCtx, error) {
+		gotOptions = options
+		tree := filetree.CreateFileTreeCtx()
+		return &fakeAPICtx{tree: &tree}, nil
+	}
+	if _, err := newConfiguredRMAPIClient(Options{Host: "https://cloud.example", UserToken: "test-user-token"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if gotOptions.CacheDir != "" {
+		t.Fatalf("interactive rmapi cache dir = %q, want empty default selector", gotOptions.CacheDir)
+	}
+}
 
 // TestRealClientListHidesSyntheticTrash proves that rmapi's always-present
 // "trash" collection (filetree.CreateFileTreeCtx adds it as a child of root

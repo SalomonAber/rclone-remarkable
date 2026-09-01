@@ -95,11 +95,26 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		opt.Config = os.Getenv("RMAPI_CONFIG")
 	}
 	opt.Host, root = normalizeConnectionHost(opt.Host, root)
-	client, err := newConfiguredRMAPIClient(*opt)
+	rcloneCacheDir := config.GetCacheDir()
+	client, err := newConfiguredRMAPIClient(*opt, rmapiMetadataCacheRoot(rcloneCacheDir))
 	if err != nil {
 		return nil, err
 	}
-	return newFs(ctx, name, root, client, filepath.Join(config.GetCacheDir(), "remarkable"))
+	return newFs(ctx, name, root, client, filepath.Join(rcloneCacheDir, "remarkable"))
+}
+
+func rmapiMetadataCacheRoot(rcloneCacheDir string) string {
+	if rcloneCacheDir == "" {
+		return ""
+	}
+	userCacheDir, err := os.UserCacheDir()
+	if err != nil || userCacheDir == "" {
+		return filepath.Join(rcloneCacheDir, "remarkable-metadata")
+	}
+	if filepath.Clean(rcloneCacheDir) == filepath.Join(filepath.Clean(userCacheDir), "rclone") {
+		return ""
+	}
+	return filepath.Join(rcloneCacheDir, "remarkable-metadata")
 }
 
 // normalizeConnectionHost repairs unescaped http:// URLs in rclone connection strings.

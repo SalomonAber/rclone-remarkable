@@ -39,7 +39,7 @@ func TestRMFakecloudIntegration(t *testing.T) {
 		Config:          configPath,
 		DeviceToken:     os.Getenv("REMARKABLE_DEVICE_TOKEN"),
 		UserToken:       os.Getenv("REMARKABLE_USER_TOKEN"),
-	})
+	}, filepath.Join(t.TempDir(), "rmapi-metadata"))
 	if err != nil {
 		t.Fatal(err)
 	}

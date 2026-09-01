@@ -85,6 +85,8 @@ You need a running rmfakecloud instance and an rmapi YAML file containing `devic
 
 The imported module installs this project's `mount.rclone` through `system.fsPackages`, so the normal NixOS `fileSystems` integration uses the custom backend without a hand-written systemd service. Existing `.rmdoc` files can be read, renamed, moved, and removed. Copying a new valid `.rmdoc` into the mount imports one reMarkable document; overwriting an existing document is intentionally rejected.
 
+The explicit `cache_dir` also provides rmapi's metadata-cache root, so the generated systemd mount unit does not need `HOME` or `XDG_CACHE_HOME`. With the example above, document archives are stored beneath `/var/cache/rclone/remarkable/remarkable`, rmapi metadata beneath `/var/cache/rclone/remarkable/remarkable-metadata/<account-hash>/tree.cache`, and rclone's VFS cache in its standard separate subtree.
+
 ## Architecture
 
 The custom binary follows rclone's official out-of-tree pattern: `rclone.go` imports rclone's commands and blank-imports `backend/remarkable`, whose `init` function calls `fs.Register`. It intentionally does not import `backend/all`, keeping the binary limited to this backend.
@@ -142,7 +144,7 @@ rmapi normalizes imported archives, so a later downloaded `.rmdoc` is semantical
 
 ## rmapi findings
 
-The actively maintained `ddvk/rmapi` fork is used as a Go library. Its module still declares `github.com/juruen/rmapi`, and its packages import that path internally. `go.mod` therefore requires the declared path and replaces it with `ddvk/rmapi` at commit `aa60dac8a8dbb1b4eb6a25f2caf2f3daea573373` (2026-08-23). This revision includes the root-index canonical sorting fix required by current sync servers, plus newer sync and document-format fixes.
+The backend temporarily uses `SalomonAber/rmapi` at commit `079db5cbc5e395d1f1c82d9aa951def852abec1d` (2026-09-01), based directly on `ddvk/rmapi` commit `aa60dac8a8dbb1b4eb6a25f2caf2f3daea573373`. The fork adds a caller-configurable sync metadata cache directory and will be replaced by upstream `ddvk/rmapi` once that API is available there. The module still declares `github.com/juruen/rmapi`, so `go.mod` requires that path and uses a replacement. This revision also includes ddvk's root-index canonical sorting fix and newer sync and document-format fixes.
 
 The relevant library surface is the sync 1.5 `api.ApiCtx` and its `filetree`/`model` packages:
 
@@ -215,15 +217,15 @@ RCLONE_REMARKABLE_REFRESH_INTERVAL=30s \
 
 Use an absolute persistent `--cache-dir` for normal operation. `full` mode gives editors and other POSIX applications stable local seek/read behavior; `--vfs-write-back 0s` starts remote creation as soon as a new file closes. Polling is disabled because this backend does not implement rclone's change-notify interface; instead, `refresh_interval` bounds rmapi metadata refreshes during listings. Keep `--dir-cache-time` near that interval. Successful mutations update rmapi's in-process tree immediately, so they do not wait for either interval.
 
-The backend content cache remains keyed by UUID and remote version beneath `<cache-dir>/remarkable`. Metadata-only file moves atomically derive the new version from the cached `.rmdoc` and rewrite its embedded metadata, avoiding a remote content download. The VFS cache is a separate rclone-managed layer. Testing confirmed repeated stats, copy-out, and eight concurrent opens reused one VFS entry; unmount left valid ZIP archives and no `.materializing-*` or `.promoting-*` files.
+The backend content cache remains keyed by UUID and remote version beneath `<cache-dir>/remarkable`. When `--cache-dir` differs from rclone's normal interactive default, rmapi metadata is stored separately at `<cache-dir>/remarkable-metadata/<account-hash>/tree.cache`. The account hash is deterministic per host and user token and does not expose either value. Metadata-only file moves atomically derive the new version from the cached `.rmdoc` and rewrite its embedded metadata, avoiding a remote content download. The VFS cache is a separate rclone-managed layer. Testing confirmed repeated stats, copy-out, and eight concurrent opens reused one VFS entry; unmount left valid ZIP archives and no `.materializing-*` or `.promoting-*` files.
 
 Copying a valid new `.rmdoc` into the mount is supported. Opening an existing remote object for write, truncating it, or copying over it is rejected. With full VFS caching, writeback happens asynchronously, so scripts that must synchronously observe upload errors should prefer `rclone copyto`; mount writeback failures are retained by VFS and logged.
 
 ## Compatibility Notes
 
-- rmapi's endpoint URLs are package-global values. The backend sets them from `host` before constructing its client, so different `remarkable` hosts are not safe to use simultaneously in one rclone process.
+- rmapi's endpoint URLs are package-global values. The backend serializes network operations and reapplies each client's `host`, so different `remarkable` hosts can safely coexist in one rclone process at the cost of serialized rmapi requests.
 - Rclone connection strings use `:` to separate options from the remote path, which normally splits an unescaped `http://host:port` value. The backend recognizes and repairs the resulting parsed form for HTTP/HTTPS hosts with numeric ports, so the short command examples above work as written. Standard configured remotes and escaped connection strings do not need this compatibility path.
-- rmapi persists its sync tree separately in the OS cache directory (`rmapi/tree.cache`), outside rclone's `--cache-dir`. The client refreshes that tree during construction and periodically while listing.
+- With rclone's normal interactive default cache directory, rmapi preserves its existing OS-cache behavior at `<os-user-cache>/rmapi/tree.cache`. An explicit `--cache-dir` instead places account-separated trees at `<cache-dir>/remarkable-metadata/<account-hash>/tree.cache`; this works for systemd mount units without `HOME` or `XDG_CACHE_HOME`. The client refreshes its tree during construction and periodically while listing.
 - rmfakecloud supports the sync 1.5/v3/v4 routes used by current rmapi. Its deployment must issue a valid sync 1.5 user token and configure a storage URL reachable by the client; newer reMarkable software has additional HTTPS/no-port restrictions documented by rmfakecloud.
 
 ## NixOS Packaging Details
