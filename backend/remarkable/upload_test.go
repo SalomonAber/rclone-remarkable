@@ -13,8 +13,12 @@ import (
 	"testing"
 	"time"
 
+	_ "github.com/rclone/rclone/backend/local"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/object"
+	"github.com/rclone/rclone/vfs"
+	"github.com/rclone/rclone/vfs/vfscommon"
 )
 
 const uploadDocumentID = "2a9b9220-45d8-49c3-8393-2a1fd8a5a6f7"
@@ -133,6 +137,93 @@ func TestNativeImportChecksCanonicalRMDOCNameForCollision(t *testing.T) {
 	}
 	if len(client.uploads) != 0 {
 		t.Fatalf("collision invoked upload: %#v", client.uploads)
+	}
+}
+
+func TestVFSDragAndDropCanonicalizesNativeDocumentAfterClose(t *testing.T) {
+	tests := []struct {
+		name      string
+		fileName  string
+		canonical string
+		content   []byte
+	}{
+		{name: "PDF", fileName: "Dragged Report.pdf", canonical: "Dragged Report.rmdoc", content: validPDF()},
+		{name: "EPUB", fileName: "Dragged Book.epub", canonical: "Dragged Book.rmdoc", content: validEPUB(t)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			client := &fakeClient{items: map[string]Item{
+				"work": {ID: "work", Name: "Work", Kind: ItemDirectory},
+			}}
+			backend, err := newFs(ctx, "vfs-import-"+strings.ToLower(test.name), "", client, t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			oldCacheDir := config.GetCacheDir()
+			if err := config.SetCacheDir(t.TempDir()); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := config.SetCacheDir(oldCacheDir); err != nil {
+					t.Errorf("restore cache directory: %v", err)
+				}
+			})
+
+			options := vfscommon.Opt
+			options.CacheMode = vfscommon.CacheModeFull
+			options.WriteBack = 0
+			options.PollInterval = 0
+			mounted := vfs.New(ctx, backend, &options)
+			t.Cleanup(func() {
+				mounted.WaitForWriters(5 * time.Second)
+				if err := mounted.CleanUp(); err != nil {
+					t.Errorf("clean up VFS: %v", err)
+				}
+				mounted.Shutdown()
+			})
+
+			remote := path.Join("Work", test.fileName)
+			handle, err := mounted.OpenFile(remote, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+			if err != nil {
+				t.Fatal(err)
+			}
+			split := len(test.content) / 2
+			if _, err := handle.Write(test.content[:split]); err != nil {
+				t.Fatal(err)
+			}
+			assertVFSNames(t, mounted, "Work", test.fileName)
+			if len(client.uploads) != 0 {
+				t.Fatalf("upload started before source close: %#v", client.uploads)
+			}
+			if _, err := handle.Write(test.content[split:]); err != nil {
+				t.Fatal(err)
+			}
+			if err := handle.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			assertVFSNames(t, mounted, "Work", test.canonical)
+			if len(client.uploads) != 1 {
+				t.Fatalf("upload calls = %#v", client.uploads)
+			}
+		})
+	}
+}
+
+func assertVFSNames(t *testing.T, mounted *vfs.VFS, dir string, want ...string) {
+	t.Helper()
+	entries, err := mounted.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]string, len(entries))
+	for index, entry := range entries {
+		got[index] = entry.Name()
+	}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("VFS entries in %q = %q, want %q", dir, got, want)
 	}
 }
 

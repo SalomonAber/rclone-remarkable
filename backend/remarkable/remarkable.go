@@ -91,6 +91,9 @@ type Fs struct {
 	client        Client
 	cache         *contentCache
 	uploadTempDir string
+	notifyMu      sync.Mutex
+	notifyNextID  uint64
+	notifiers     map[uint64]func(string, fs.EntryType)
 }
 
 // NewFs constructs a filesystem backed by a configured rmapi sync 1.5 client.
@@ -191,6 +194,15 @@ func (f *Fs) Features() *fs.Features   { return f.features }
 // reliable way to cover moves, deletions, and changes below already-cached
 // subdirectories.
 func (f *Fs) ChangeNotify(ctx context.Context, notifyFunc func(string, fs.EntryType), pollIntervalChan <-chan time.Duration) {
+	f.notifyMu.Lock()
+	if f.notifiers == nil {
+		f.notifiers = make(map[uint64]func(string, fs.EntryType))
+	}
+	notifierID := f.notifyNextID
+	f.notifyNextID++
+	f.notifiers[notifierID] = notifyFunc
+	f.notifyMu.Unlock()
+
 	go func() {
 		var ticker *time.Ticker
 		var tickerC <-chan time.Time
@@ -198,6 +210,9 @@ func (f *Fs) ChangeNotify(ctx context.Context, notifyFunc func(string, fs.EntryT
 			if ticker != nil {
 				ticker.Stop()
 			}
+			f.notifyMu.Lock()
+			delete(f.notifiers, notifierID)
+			f.notifyMu.Unlock()
 		}()
 
 		for {
@@ -228,6 +243,22 @@ func (f *Fs) ChangeNotify(ctx context.Context, notifyFunc func(string, fs.EntryT
 			}
 		}
 	}()
+}
+
+// notifyChange immediately invalidates mounted VFS directory caches after a
+// local mutation. Polling remains necessary for mutations made by the tablet
+// or another client, but waiting for the next poll after our own PDF/EPUB
+// import would leave the write-only source name visible unnecessarily.
+func (f *Fs) notifyChange(remote string, entryType fs.EntryType) {
+	f.notifyMu.Lock()
+	notifiers := make([]func(string, fs.EntryType), 0, len(f.notifiers))
+	for _, notify := range f.notifiers {
+		notifiers = append(notifiers, notify)
+	}
+	f.notifyMu.Unlock()
+	for _, notify := range notifiers {
+		notify(remote, entryType)
+	}
 }
 
 func (f *Fs) notifyDirectoryTree(ctx context.Context, notifyFunc func(string, fs.EntryType)) {
@@ -364,6 +395,12 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, _ ...fs.O
 	}
 	item.Name = visibleName
 	item.ParentID = parentID
+	if extension != "rmdoc" {
+		// The VFS wrote the import-only source name (for example Report.pdf),
+		// while listings expose Report.rmdoc. Mark its parent stale now so the
+		// next directory read replaces the transient VFS entry immediately.
+		f.notifyChange(canonicalRemote, fs.EntryObject)
+	}
 	// rmapi synthesizes or normalizes the remote archive while importing, so
 	// its .rmdoc size is unknown until that representation is materialized.
 	return &Object{fs: f, remote: canonicalRemote, item: item, size: -1}, nil

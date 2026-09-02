@@ -1,6 +1,8 @@
 package remarkable
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -129,6 +131,15 @@ func (c *fakeClient) Upload(_ context.Context, parentID, sourcePath string) (Ite
 	if err != nil {
 		return Item{}, err
 	}
+	var remoteContent []byte
+	if extension == "rmdoc" {
+		remoteContent, err = os.ReadFile(sourcePath)
+	} else {
+		remoteContent, err = fakeRMDOC(documentID)
+	}
+	if err != nil {
+		return Item{}, err
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.uploads = append(c.uploads, uploadCall{ParentID: parentID, SourcePath: sourcePath})
@@ -144,8 +155,35 @@ func (c *fakeClient) Upload(_ context.Context, parentID, sourcePath string) (Ite
 	if c.items == nil {
 		c.items = make(map[string]Item)
 	}
+	if c.contents == nil {
+		c.contents = make(map[string][]byte)
+	}
 	c.items[item.ID] = item
+	c.contents[item.ID] = remoteContent
 	return item, nil
+}
+
+func fakeRMDOC(documentID string) ([]byte, error) {
+	var buffer bytes.Buffer
+	writer := zip.NewWriter(&buffer)
+	metadata, err := writer.Create(documentID + ".metadata")
+	if err != nil {
+		return nil, err
+	}
+	if _, err := metadata.Write([]byte(`{"visibleName":"imported","type":"DocumentType"}`)); err != nil {
+		return nil, err
+	}
+	content, err := writer.Create(documentID + ".content")
+	if err != nil {
+		return nil, err
+	}
+	if _, err := content.Write([]byte(`{}`)); err != nil {
+		return nil, err
+	}
+	if err := writer.Close(); err != nil {
+		return nil, err
+	}
+	return buffer.Bytes(), nil
 }
 func (c *fakeClient) Move(_ context.Context, id, parentID, name string) (Item, error) {
 	c.mu.Lock()
