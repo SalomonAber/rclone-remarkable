@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -31,6 +32,7 @@ type fakeClient struct {
 	refreshes       int
 	refreshChanged  bool
 	refreshErr      error
+	refreshErrors   []error
 	nextID          int
 	downloadStarted chan struct{}
 	releaseDownload chan struct{}
@@ -68,9 +70,19 @@ func (c *fakeClient) Refresh(_ context.Context) (bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.refreshes++
+	if len(c.refreshErrors) > 0 {
+		err := c.refreshErrors[0]
+		c.refreshErrors = c.refreshErrors[1:]
+		if err != nil {
+			return false, err
+		}
+	}
+	if c.refreshErr != nil {
+		return false, c.refreshErr
+	}
 	changed := c.refreshChanged
 	c.refreshChanged = false
-	return changed, c.refreshErr
+	return changed, nil
 }
 
 func (c *fakeClient) Get(_ context.Context, id string) (Item, error) {
@@ -300,6 +312,40 @@ func TestChangeNotifyRefreshesAndInvalidatesDirectoryTree(t *testing.T) {
 	client.mu.Unlock()
 	if refreshes == 0 {
 		t.Fatal("metadata was not refreshed")
+	}
+}
+
+func TestChangeNotifyRetriesAfterRefreshError(t *testing.T) {
+	client := &fakeClient{
+		items:          map[string]Item{},
+		refreshChanged: true,
+		refreshErrors:  []error{errors.New("network unavailable")},
+	}
+	backend, err := newFs(context.Background(), "test", "", client, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	intervals := make(chan time.Duration, 1)
+	notified := make(chan struct{}, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	backend.ChangeNotify(ctx, func(remote string, entryType fs.EntryType) {
+		if remote == "" && entryType == fs.EntryDirectory {
+			notified <- struct{}{}
+		}
+	}, intervals)
+	intervals <- time.Millisecond
+
+	select {
+	case <-notified:
+	case <-time.After(time.Second):
+		t.Fatal("poll loop did not recover after a refresh error")
+	}
+	client.mu.Lock()
+	refreshes := client.refreshes
+	client.mu.Unlock()
+	if refreshes < 2 {
+		t.Fatalf("refresh calls = %d, want at least two", refreshes)
 	}
 }
 

@@ -3,6 +3,7 @@ package remarkable
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -26,6 +27,8 @@ type fakeAPICtx struct {
 	refreshHash       string
 	refreshGeneration int64
 	refreshErr        error
+	refreshHook       func(*fakeAPICtx)
+	refreshCalls      int
 }
 
 func (f *fakeAPICtx) Filetree() *filetree.FileTreeCtx    { return f.tree }
@@ -44,6 +47,10 @@ func (f *fakeAPICtx) DeleteEntry(*model.Node, bool, bool) error { return nil }
 func (f *fakeAPICtx) SyncComplete() error                       { return nil }
 func (f *fakeAPICtx) Nuke() error                               { return nil }
 func (f *fakeAPICtx) Refresh() (string, int64, error) {
+	f.refreshCalls++
+	if f.refreshHook != nil {
+		f.refreshHook(f)
+	}
 	return f.refreshHash, f.refreshGeneration, f.refreshErr
 }
 
@@ -70,6 +77,58 @@ func TestRMAPIRefreshDetectsSyncRootChanges(t *testing.T) {
 	api.refreshErr = fmt.Errorf("refresh failed")
 	if _, err := client.Refresh(context.Background()); err == nil {
 		t.Fatal("refresh error was not returned")
+	}
+}
+
+func TestRMAPIListPreservesTreeAndRecreatesClientAfterRefreshFailure(t *testing.T) {
+	oldTree := filetree.CreateFileTreeCtx()
+	oldTree.AddDocument(&model.Document{ID: "old", Name: "Last successful", Type: model.DirectoryType})
+	failingAPI := &fakeAPICtx{tree: &oldTree, refreshErr: errors.New("network unavailable")}
+	failingAPI.refreshHook = func(api *fakeAPICtx) {
+		empty := filetree.CreateFileTreeCtx()
+		api.tree = &empty
+	}
+
+	newTree := filetree.CreateFileTreeCtx()
+	newTree.AddDocument(&model.Document{ID: "new", Name: "Recovered", Type: model.DirectoryType})
+	recoveredAPI := &fakeAPICtx{tree: &newTree, refreshHash: "recovered", refreshGeneration: 2}
+	recreateCalls := 0
+	client := &rmapiClient{
+		api:             failingAPI,
+		tree:            &oldTree,
+		refreshInterval: time.Second,
+		lastRefresh:     time.Now().Add(-time.Hour),
+		recreate: func() (rmapi.ApiCtx, error) {
+			recreateCalls++
+			return recoveredAPI, nil
+		},
+	}
+
+	items, err := client.List(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].ID != "old" {
+		t.Fatalf("listing after failed refresh = %#v, want last successful tree", items)
+	}
+	items, err = client.List(context.Background(), "")
+	if err != nil || len(items) != 1 || items[0].ID != "old" {
+		t.Fatalf("listing during backoff = %#v, error %v; want last successful tree", items, err)
+	}
+	if recreateCalls != 0 {
+		t.Fatalf("client recreated during backoff, calls = %d", recreateCalls)
+	}
+
+	client.nextRefreshTry = time.Now().Add(-time.Second)
+	items, err = client.List(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recreateCalls != 1 || recoveredAPI.refreshCalls != 1 {
+		t.Fatalf("recreate calls = %d, recovered refresh calls = %d", recreateCalls, recoveredAPI.refreshCalls)
+	}
+	if len(items) != 1 || items[0].ID != "new" {
+		t.Fatalf("listing after recovery = %#v, want recovered tree", items)
 	}
 }
 

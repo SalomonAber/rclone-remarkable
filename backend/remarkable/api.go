@@ -64,9 +64,13 @@ type Client interface {
 type rmapiClient struct {
 	mu              sync.Mutex
 	api             rmapi.ApiCtx
+	tree            *filetree.FileTreeCtx
 	host            string
 	refreshInterval time.Duration
 	lastRefresh     time.Time
+	recreate        func() (rmapi.ApiCtx, error)
+	refreshFailures uint
+	nextRefreshTry  time.Time
 	lastNotifyHash  string
 	lastNotifyGen   int64
 	lastNotifySet   bool
@@ -82,15 +86,11 @@ type rmapiClient struct {
 var rmapiHostMu sync.Mutex
 
 func newRMAPIClient(api rmapi.ApiCtx, host string, refreshInterval time.Duration) Client {
-	return &rmapiClient{api: api, host: host, refreshInterval: refreshInterval, lastRefresh: time.Now()}
+	return &rmapiClient{api: api, tree: api.Filetree(), host: host, refreshInterval: refreshInterval, lastRefresh: time.Now()}
 }
 
 // NewConfiguredRMAPIClient creates an rmapi-backed client with optional token refresh persistence.
 func NewConfiguredRMAPIClient(opt Options, metadataCacheRoot string) (Client, error) {
-	httpCtx, err := newRMAPIHTTPClientCtx(opt)
-	if err != nil {
-		return nil, err
-	}
 	tokens, err := rmapiTokens(opt)
 	if err != nil {
 		return nil, err
@@ -99,32 +99,49 @@ func NewConfiguredRMAPIClient(opt Options, metadataCacheRoot string) (Client, er
 		return nil, fmt.Errorf("remarkable: user token is required; set user_token or provide config with usertoken")
 	}
 
-	// The host is (re)applied immediately before each request under
-	// rmapiHostMu (see below); CreateApiCtx itself only needs a host to be
-	// configured for its initial tree mirror, so apply it once here too.
-	rmapiHostMu.Lock()
-	configureRMAPIHost(opt.Host)
-	httpCtx.Tokens = tokens
 	metadataCacheDir := ""
 	if metadataCacheRoot != "" {
 		accountID := sha256.Sum256([]byte(opt.Host + "\x00" + tokens.UserToken))
 		metadataCacheDir = filepath.Join(metadataCacheRoot, fmt.Sprintf("%x", accountID))
 	}
-	apiCtx, refreshedToken, err := createRMAPIContextWithRefresh(&httpCtx, rmapi.Options{CacheDir: metadataCacheDir})
+	recreate := func() (rmapi.ApiCtx, error) {
+		httpCtx, err := newRMAPIHTTPClientCtx(opt)
+		if err != nil {
+			return nil, err
+		}
+		httpCtx.Tokens = tokens
+		apiCtx, refreshedToken, err := createRMAPIContextWithRefresh(&httpCtx, rmapi.Options{CacheDir: metadataCacheDir})
+		if err != nil {
+			return nil, err
+		}
+		if refreshedToken != "" {
+			if opt.OnUserTokenRefresh != nil {
+				if err := opt.OnUserTokenRefresh(refreshedToken); err != nil {
+					return nil, errors.New("remarkable: user token refreshed but persistence callback failed")
+				}
+			}
+			tokens.UserToken = refreshedToken
+		}
+		return apiCtx, nil
+	}
+
+	// The host is (re)applied immediately before each request under
+	// rmapiHostMu (see below); CreateApiCtx itself only needs a host to be
+	// configured for its initial tree mirror, so apply it once here too.
+	rmapiHostMu.Lock()
+	configureRMAPIHost(opt.Host)
+	apiCtx, err := recreate()
 	rmapiHostMu.Unlock()
 	if err != nil {
 		return nil, fmt.Errorf("remarkable: initialize rmapi sync client: %w", err)
-	}
-	if refreshedToken != "" && opt.OnUserTokenRefresh != nil {
-		if err := opt.OnUserTokenRefresh(refreshedToken); err != nil {
-			return nil, errors.New("remarkable: user token refreshed but persistence callback failed")
-		}
 	}
 	refreshInterval := time.Duration(opt.RefreshInterval)
 	if refreshInterval <= 0 {
 		refreshInterval = 30 * time.Second
 	}
-	return newRMAPIClient(apiCtx, opt.Host, refreshInterval), nil
+	client := newRMAPIClient(apiCtx, opt.Host, refreshInterval).(*rmapiClient)
+	client.recreate = recreate
+	return client, nil
 }
 
 func createRMAPIContextWithRefresh(httpCtx *transport.HttpClientCtx, options rmapi.Options) (rmapi.ApiCtx, string, error) {
@@ -233,12 +250,12 @@ func (c *rmapiClient) List(_ context.Context, parentID string) ([]Item, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if time.Since(c.lastRefresh) >= c.refreshInterval {
-		if _, _, err := c.api.Refresh(); err != nil {
-			return nil, fmt.Errorf("rmapi: refresh file tree: %w", err)
-		}
-		c.lastRefresh = time.Now()
+		// A metadata outage must not turn a healthy FUSE mount into an empty
+		// directory. refreshLocked retains c.tree on failure, so listings can
+		// continue from the last complete mirror while recovery is retried.
+		_, _ = c.refreshLocked(time.Now())
 	}
-	parent := c.api.Filetree().NodeById(parentID)
+	parent := c.filetree().NodeById(parentID)
 	if parent == nil || !parent.IsDirectory() {
 		return nil, fmt.Errorf("rmapi: parent %q is not a directory", parentID)
 	}
@@ -273,11 +290,42 @@ func (c *rmapiClient) Refresh(_ context.Context) (bool, error) {
 	defer rmapiHostMu.Unlock()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	hash, generation, err := c.api.Refresh()
-	if err != nil {
-		return false, fmt.Errorf("rmapi: refresh file tree: %w", err)
+	return c.refreshLocked(time.Now())
+}
+
+const maxRefreshBackoff = time.Minute
+
+func (c *rmapiClient) filetree() *filetree.FileTreeCtx {
+	if c.tree == nil {
+		c.tree = c.api.Filetree()
 	}
-	c.lastRefresh = time.Now()
+	return c.tree
+}
+
+func (c *rmapiClient) refreshLocked(now time.Time) (bool, error) {
+	if now.Before(c.nextRefreshTry) {
+		return false, nil
+	}
+
+	apiCtx := c.api
+	if c.refreshFailures > 0 && c.recreate != nil {
+		var err error
+		apiCtx, err = c.recreate()
+		if err != nil {
+			return false, c.refreshFailed(now, err)
+		}
+	}
+	hash, generation, err := apiCtx.Refresh()
+	if err != nil {
+		return false, c.refreshFailed(now, err)
+	}
+	// Publish the replacement client and tree only after its complete mirror
+	// succeeds. In particular, never publish a partially cleared rmapi tree.
+	c.api = apiCtx
+	c.tree = apiCtx.Filetree()
+	c.lastRefresh = now
+	c.refreshFailures = 0
+	c.nextRefreshTry = time.Time{}
 	changed := !c.lastNotifySet || hash != c.lastNotifyHash || generation != c.lastNotifyGen
 	c.lastNotifyHash = hash
 	c.lastNotifyGen = generation
@@ -285,10 +333,23 @@ func (c *rmapiClient) Refresh(_ context.Context) (bool, error) {
 	return changed, nil
 }
 
+func (c *rmapiClient) refreshFailed(now time.Time, err error) error {
+	c.refreshFailures++
+	delay := time.Second
+	for i := uint(1); i < c.refreshFailures && delay < maxRefreshBackoff; i++ {
+		delay *= 2
+	}
+	if delay > maxRefreshBackoff {
+		delay = maxRefreshBackoff
+	}
+	c.nextRefreshTry = now.Add(delay)
+	return fmt.Errorf("rmapi: refresh file tree (retry in %s): %w", delay, err)
+}
+
 func (c *rmapiClient) Get(_ context.Context, id string) (Item, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	node := c.api.Filetree().NodeById(id)
+	node := c.filetree().NodeById(id)
 	if node == nil {
 		return Item{}, fmt.Errorf("%w: %q", errItemNotFound, id)
 	}
@@ -333,7 +394,7 @@ func (c *rmapiClient) Upload(_ context.Context, parentID, sourcePath string) (It
 	if err != nil {
 		return Item{}, err
 	}
-	c.api.Filetree().AddDocument(doc)
+	c.filetree().AddDocument(doc)
 	return itemFromDocument(doc)
 }
 
@@ -343,8 +404,8 @@ func (c *rmapiClient) Move(_ context.Context, id, parentID, name string) (Item, 
 	defer rmapiHostMu.Unlock()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	src := c.api.Filetree().NodeById(id)
-	dst := c.api.Filetree().NodeById(parentID)
+	src := c.filetree().NodeById(id)
+	dst := c.filetree().NodeById(parentID)
 	if src == nil || dst == nil {
 		return Item{}, fmt.Errorf("rmapi: move source or destination not found")
 	}
@@ -352,7 +413,7 @@ func (c *rmapiClient) Move(_ context.Context, id, parentID, name string) (Item, 
 	if err != nil {
 		return Item{}, err
 	}
-	c.api.Filetree().MoveNode(src, node)
+	c.filetree().MoveNode(src, node)
 	return itemFromNode(node)
 }
 
@@ -366,7 +427,7 @@ func (c *rmapiClient) Mkdir(_ context.Context, parentID, name string) (Item, err
 	if err != nil {
 		return Item{}, err
 	}
-	c.api.Filetree().AddDocument(doc)
+	c.filetree().AddDocument(doc)
 	return itemFromDocument(doc)
 }
 
@@ -376,14 +437,14 @@ func (c *rmapiClient) Remove(_ context.Context, id string) error {
 	defer rmapiHostMu.Unlock()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	node := c.api.Filetree().NodeById(id)
+	node := c.filetree().NodeById(id)
 	if node == nil {
 		return fmt.Errorf("rmapi: item %q not found", id)
 	}
 	if err := c.api.DeleteEntry(node, false, true); err != nil {
 		return err
 	}
-	c.api.Filetree().DeleteNode(node)
+	c.filetree().DeleteNode(node)
 	return nil
 }
 
