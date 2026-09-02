@@ -1,6 +1,6 @@
 # rclone-remarkable
 
-An out-of-tree rclone backend named `remarkable`. The current model exposes reMarkable collections as directories and documents as raw ZIP-compatible `.rmdoc` objects. New `.rmdoc` imports and metadata mutations are supported; editing or replacing an existing compound document is not.
+An out-of-tree rclone backend named `remarkable`. The current model exposes reMarkable collections as directories and documents as raw ZIP-compatible `.rmdoc` objects. New PDF, EPUB, and `.rmdoc` imports and metadata mutations are supported; editing or replacing an existing compound document is not.
 
 ## NixOS Quick Start
 
@@ -83,7 +83,7 @@ You need a running rmfakecloud instance and an rmapi YAML file containing `devic
 	ls /mnt/remarkable
 	```
 
-The imported module installs this project's `mount.rclone` through `system.fsPackages`, so the normal NixOS `fileSystems` integration uses the custom backend without a hand-written systemd service. Existing `.rmdoc` files can be read, renamed, moved, and removed. Copying a new valid `.rmdoc` into the mount imports one reMarkable document; overwriting an existing document is intentionally rejected.
+The imported module installs this project's `mount.rclone` through `system.fsPackages`, so the normal NixOS `fileSystems` integration uses the custom backend without a hand-written systemd service. Existing `.rmdoc` files can be read, renamed, moved, and removed. Copying a new PDF, EPUB, or valid `.rmdoc` into the mount imports one reMarkable document; overwriting an existing document is intentionally rejected. PDF and EPUB are write-only import formats and appear as `.rmdoc` after import.
 
 The explicit `cache_dir` also provides rmapi's metadata-cache root, so the generated systemd mount unit does not need `HOME` or `XDG_CACHE_HOME`. With the example above, document archives are stored beneath `/var/cache/rclone/remarkable/remarkable`, rmapi metadata beneath `/var/cache/rclone/remarkable/remarkable-metadata/<account-hash>/tree.cache`, and rclone's VFS cache in its standard separate subtree.
 
@@ -132,13 +132,13 @@ Mutations resolve source entries and destination parents to UUIDs before calling
 
 The rmapi adapter updates its in-memory file tree immediately after successful create, move, and delete calls. Rename and move never download, delete, recreate, or upload document content. Existing raw cache entries remain available by UUID and version.
 
-### `.rmdoc` creation
+### Document creation
 
-`Put` supports creating a new document at an absent `.rmdoc` path. Incoming data is streamed to a private temporary file below `<cache-dir>/remarkable/.uploads`; it is never buffered as one in-memory object. Before any remote call, the backend reads every ZIP member to verify structure and CRCs, rejects unsafe paths, and requires exactly one top-level UUID `.content` entry plus its matching `.metadata` entry. The embedded UUID must not already exist anywhere in the remote tree.
+`Put` supports creating a new document from a PDF, EPUB, or `.rmdoc`. Incoming data is streamed to a private temporary file below `<cache-dir>/remarkable/.uploads`; it is never buffered as one in-memory object. PDFs receive a basic header check. EPUBs are checked as ZIP archives with the required uncompressed `mimetype`, container metadata, and existing safe rootfiles. For `.rmdoc`, the backend reads every ZIP member to verify structure and CRCs, rejects unsafe paths, and requires exactly one top-level UUID `.content` entry plus its matching `.metadata` entry. An embedded `.rmdoc` UUID must not already exist anywhere in the remote tree.
 
-After validation, one `ApiCtx.UploadDocument` call imports the archive. rmapi rewrites the imported metadata with the destination visible name and parent, uploads component blobs, and publishes the document through the sync root. Failed validation, path/UUID collisions, and unsupported overwrite attempts are marked non-retryable; transport/API failures remain retryable.
+After validation, one `ApiCtx.UploadDocument` call imports the source. rmapi creates the reMarkable metadata and UUID for PDF/EPUB sources, or rewrites imported `.rmdoc` metadata with the destination visible name and parent, then uploads component blobs and publishes the document through the sync root. Failed validation, name/UUID collisions, unsupported formats, and unsupported overwrite attempts are marked non-retryable; transport/API failures remain retryable.
 
-rmapi normalizes imported archives, so a later downloaded `.rmdoc` is semantically equivalent but not byte-for-byte identical and may have a different ZIP size. The object returned directly from `Put` therefore reports unknown size (`-1`); a subsequent listing materializes the published representation and reports its actual size.
+The canonical readable representation is always `.rmdoc`: importing `Report.pdf` or `Book.epub` creates `Report.rmdoc` or `Book.rmdoc`. rmapi synthesizes or normalizes this archive, so it is not byte-for-byte identical to the source and has a different size. The object returned directly from `Put` therefore reports unknown size (`-1`); a subsequent listing materializes the published representation and reports its actual size.
 
 `Object.Update` deliberately rejects replacement. rmapi's `ReplaceDocumentFile` replaces one contained PDF/EPUB-style payload and does not safely replace an entire compound `.rmdoc`, so the backend does not pretend that POSIX editing semantics exist.
 
@@ -239,7 +239,7 @@ Use an absolute persistent `--cache-dir` for normal operation. `full` mode gives
 
 The backend content cache remains keyed by UUID and remote version beneath `<cache-dir>/remarkable`. When `--cache-dir` differs from rclone's normal interactive default, rmapi metadata is stored separately at `<cache-dir>/remarkable-metadata/<account-hash>/tree.cache`. The account hash is deterministic per host and user token and does not expose either value. Metadata-only file moves atomically derive the new version from the cached `.rmdoc` and rewrite its embedded metadata, avoiding a remote content download. The VFS cache is a separate rclone-managed layer. Testing confirmed repeated stats, copy-out, and eight concurrent opens reused one VFS entry; unmount left valid ZIP archives and no `.materializing-*` or `.promoting-*` files.
 
-Copying a valid new `.rmdoc` into the mount is supported. Opening an existing remote object for write, truncating it, or copying over it is rejected. With full VFS caching, writeback happens asynchronously, so scripts that must synchronously observe upload errors should prefer `rclone copyto`; mount writeback failures are retained by VFS and logged.
+Copying a new PDF, EPUB, or valid `.rmdoc` into the mount is supported. PDF and EPUB names change to the canonical `.rmdoc` suffix after writeback and directory-cache invalidation. Opening an existing remote object for write, truncating it, or copying over it is rejected. With full VFS caching, writeback happens asynchronously, so scripts that must synchronously observe upload errors should prefer `rclone copyto`; mount writeback failures are retained by VFS and logged.
 
 ## Compatibility Notes
 

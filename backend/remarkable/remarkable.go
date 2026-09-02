@@ -321,39 +321,68 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, _ ...fs.O
 	if err := f.ensureRoot(ctx, true); err != nil {
 		return nil, err
 	}
-	parentID, visibleName, err := f.destination(ctx, src.Remote(), ItemDocument, "")
+	canonicalRemote, extension, err := importRemote(src.Remote())
+	if err != nil {
+		return nil, fserrors.NoRetryError(err)
+	}
+	parentID, visibleName, err := f.destination(ctx, canonicalRemote, ItemDocument, "")
 	if err != nil {
 		if errors.Is(err, errDestinationExists) {
 			return nil, fserrors.NoRetryError(err)
 		}
 		return nil, err
 	}
-	stagedPath, _, documentID, err := stageRMDOC(ctx, in, f.uploadTempDir, visibleName)
+	var staged stagedDocument
+	if extension == "rmdoc" {
+		filePath, size, documentID, stageErr := stageRMDOC(ctx, in, f.uploadTempDir, visibleName)
+		staged = stagedDocument{filePath: filePath, size: size, documentID: documentID}
+		err = stageErr
+	} else {
+		staged, err = stageNativeDocument(ctx, in, f.uploadTempDir, visibleName, extension)
+	}
 	if err != nil {
-		if errors.Is(err, errInvalidRMDOC) {
+		if errors.Is(err, errInvalidRMDOC) || errors.Is(err, errInvalidImport) {
 			return nil, fserrors.NoRetryError(err)
 		}
 		return nil, err
 	}
-	defer removeStagedRMDOC(stagedPath)
-	if existing, err := f.client.Get(ctx, documentID); err == nil {
-		return nil, fserrors.NoRetryError(fmt.Errorf("%w: UUID %q is already visible as %q", errDestinationExists, documentID, localName(existing)))
-	} else if !errors.Is(err, errItemNotFound) {
-		return nil, err
+	defer removeStagedDocument(staged.filePath)
+	if staged.documentID != "" {
+		if existing, getErr := f.client.Get(ctx, staged.documentID); getErr == nil {
+			return nil, fserrors.NoRetryError(fmt.Errorf("%w: UUID %q is already visible as %q", errDestinationExists, staged.documentID, localName(existing)))
+		} else if !errors.Is(getErr, errItemNotFound) {
+			return nil, getErr
+		}
 	}
 
-	item, err := f.client.Upload(ctx, parentID, stagedPath)
+	item, err := f.client.Upload(ctx, parentID, staged.filePath)
 	if err != nil {
-		return nil, fmt.Errorf("upload rmdoc: %w", err)
+		return nil, fmt.Errorf("upload %s: %w", extension, err)
 	}
-	if item.ID != documentID {
-		return nil, fmt.Errorf("uploaded UUID %q does not match source UUID %q", item.ID, documentID)
+	if staged.documentID != "" && item.ID != staged.documentID {
+		return nil, fmt.Errorf("uploaded UUID %q does not match source UUID %q", item.ID, staged.documentID)
 	}
 	item.Name = visibleName
 	item.ParentID = parentID
-	// rmapi normalizes archive metadata while importing, so the size of the
-	// newly synthesized remote .rmdoc is unknown until it is materialized.
-	return &Object{fs: f, remote: src.Remote(), item: item, size: -1}, nil
+	// rmapi synthesizes or normalizes the remote archive while importing, so
+	// its .rmdoc size is unknown until that representation is materialized.
+	return &Object{fs: f, remote: canonicalRemote, item: item, size: -1}, nil
+}
+
+func importRemote(remote string) (canonicalRemote, extension string, err error) {
+	extension = strings.ToLower(strings.TrimPrefix(path.Ext(remote), "."))
+	switch extension {
+	case "rmdoc":
+		return remote, extension, nil
+	case "pdf", "epub":
+		base := strings.TrimSuffix(remote, path.Ext(remote))
+		if path.Base(base) == "" || path.Base(base) == "." {
+			return "", "", fmt.Errorf("document visible name must not be empty")
+		}
+		return base + ".rmdoc", extension, nil
+	default:
+		return "", "", fmt.Errorf("unsupported document import %q: destination must end in .pdf, .epub, or .rmdoc", remote)
+	}
 }
 
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {

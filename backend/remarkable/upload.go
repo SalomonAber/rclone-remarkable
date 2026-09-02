@@ -2,8 +2,10 @@ package remarkable
 
 import (
 	"archive/zip"
+	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -18,14 +20,42 @@ import (
 )
 
 var errInvalidRMDOC = errors.New("invalid rmdoc")
+var errInvalidImport = errors.New("invalid document import")
+
+type stagedDocument struct {
+	filePath   string
+	size       int64
+	documentID string
+}
 
 func stageRMDOC(ctx context.Context, in io.Reader, tempRoot, visibleName string) (filePath string, size int64, documentID string, err error) {
-	if err := os.MkdirAll(tempRoot, 0o700); err != nil {
+	staged, err := stageDocument(ctx, in, tempRoot, visibleName, "rmdoc", errInvalidRMDOC, validateRMDOC)
+	if err != nil {
 		return "", 0, "", err
+	}
+	return staged.filePath, staged.size, staged.documentID, nil
+}
+
+func stageNativeDocument(ctx context.Context, in io.Reader, tempRoot, visibleName, extension string) (stagedDocument, error) {
+	var validate func(string) (string, error)
+	switch extension {
+	case "pdf":
+		validate = func(filePath string) (string, error) { return "", validatePDF(filePath) }
+	case "epub":
+		validate = func(filePath string) (string, error) { return "", validateEPUB(filePath) }
+	default:
+		return stagedDocument{}, fmt.Errorf("unsupported document import extension %q", extension)
+	}
+	return stageDocument(ctx, in, tempRoot, visibleName, extension, errInvalidImport, validate)
+}
+
+func stageDocument(ctx context.Context, in io.Reader, tempRoot, visibleName, extension string, validationError error, validate func(string) (string, error)) (staged stagedDocument, err error) {
+	if err := os.MkdirAll(tempRoot, 0o700); err != nil {
+		return stagedDocument{}, err
 	}
 	tempDir, err := os.MkdirTemp(tempRoot, ".upload-*")
 	if err != nil {
-		return "", 0, "", err
+		return stagedDocument{}, err
 	}
 	defer func() {
 		if err != nil {
@@ -33,12 +63,12 @@ func stageRMDOC(ctx context.Context, in io.Reader, tempRoot, visibleName string)
 		}
 	}()
 
-	filePath = filepath.Join(tempDir, visibleName+".rmdoc")
-	file, err := os.OpenFile(filePath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	staged.filePath = filepath.Join(tempDir, visibleName+"."+extension)
+	file, err := os.OpenFile(staged.filePath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
-		return "", 0, "", err
+		return stagedDocument{}, err
 	}
-	size, err = io.Copy(file, readers.NewContextReader(ctx, in))
+	staged.size, err = io.Copy(file, readers.NewContextReader(ctx, in))
 	if err == nil {
 		err = file.Sync()
 	}
@@ -47,13 +77,111 @@ func stageRMDOC(ctx context.Context, in io.Reader, tempRoot, visibleName string)
 		err = closeErr
 	}
 	if err != nil {
-		return "", 0, "", fmt.Errorf("stage rmdoc: %w", err)
+		return stagedDocument{}, fmt.Errorf("stage %s: %w", extension, err)
 	}
-	documentID, err = validateRMDOC(filePath)
+	staged.documentID, err = validate(staged.filePath)
 	if err != nil {
-		return "", 0, "", fmt.Errorf("%w: %v", errInvalidRMDOC, err)
+		return stagedDocument{}, fmt.Errorf("%w: %v", validationError, err)
 	}
-	return filePath, size, documentID, nil
+	return staged, nil
+}
+
+func validatePDF(filePath string) error {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	header := make([]byte, 1024)
+	n, err := io.ReadFull(file, header)
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return err
+	}
+	if !bytes.Contains(header[:n], []byte("%PDF-")) {
+		return errors.New("missing PDF header")
+	}
+	return nil
+}
+
+type epubContainer struct {
+	Rootfiles []struct {
+		FullPath string `xml:"full-path,attr"`
+	} `xml:"rootfiles>rootfile"`
+}
+
+func validateEPUB(filePath string) error {
+	archive, err := zip.OpenReader(filePath)
+	if err != nil {
+		return fmt.Errorf("invalid EPUB ZIP: %w", err)
+	}
+	defer archive.Close()
+
+	entries := make(map[string]bool, len(archive.File))
+	var container epubContainer
+	mimetypeFound := false
+	containerFound := false
+	for index, entry := range archive.File {
+		name := strings.TrimSuffix(entry.Name, "/")
+		if name == "" || path.IsAbs(name) || path.Clean(name) != name || strings.Contains(name, `\`) {
+			return fmt.Errorf("invalid EPUB entry path %q", entry.Name)
+		}
+		entries[name] = true
+		if entry.FileInfo().IsDir() {
+			continue
+		}
+		reader, err := entry.Open()
+		if err != nil {
+			return fmt.Errorf("open EPUB entry %q: %w", entry.Name, err)
+		}
+		switch name {
+		case "mimetype":
+			if index != 0 || entry.Method != zip.Store {
+				_ = reader.Close()
+				return errors.New("mimetype must be the first, uncompressed EPUB entry")
+			}
+			data, readErr := io.ReadAll(io.LimitReader(reader, 256))
+			if readErr == nil && string(data) != "application/epub+zip" {
+				readErr = errors.New("invalid EPUB mimetype")
+			}
+			err = readErr
+			mimetypeFound = err == nil
+		case "META-INF/container.xml":
+			if entry.UncompressedSize64 > 1<<20 {
+				_ = reader.Close()
+				return errors.New("EPUB container.xml is too large")
+			}
+			err = xml.NewDecoder(reader).Decode(&container)
+			if err == nil {
+				_, err = io.Copy(io.Discard, reader)
+			}
+			containerFound = err == nil
+		default:
+			_, err = io.Copy(io.Discard, reader)
+		}
+		closeErr := reader.Close()
+		if err != nil {
+			return fmt.Errorf("read EPUB entry %q: %w", entry.Name, err)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("close EPUB entry %q: %w", entry.Name, closeErr)
+		}
+	}
+	if !mimetypeFound {
+		return errors.New("missing EPUB mimetype")
+	}
+	if !containerFound {
+		return errors.New("missing EPUB META-INF/container.xml")
+	}
+	if len(container.Rootfiles) == 0 {
+		return errors.New("EPUB container has no rootfile")
+	}
+	for _, rootfile := range container.Rootfiles {
+		clean := path.Clean(rootfile.FullPath)
+		if rootfile.FullPath == "" || clean != rootfile.FullPath || path.IsAbs(clean) || strings.HasPrefix(clean, "../") || !entries[clean] {
+			return fmt.Errorf("EPUB rootfile %q is missing or unsafe", rootfile.FullPath)
+		}
+	}
+	return nil
 }
 
 func validateRMDOC(filePath string) (string, error) {
@@ -123,7 +251,7 @@ func validateRMDOC(filePath string) (string, error) {
 	return documentID, nil
 }
 
-func removeStagedRMDOC(filePath string) {
+func removeStagedDocument(filePath string) {
 	if filePath != "" {
 		_ = os.RemoveAll(filepath.Dir(filePath))
 	}

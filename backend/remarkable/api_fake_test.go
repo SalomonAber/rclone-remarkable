@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/juruen/rmapi/model"
 	"github.com/rclone/rclone/fs"
 )
@@ -110,7 +111,21 @@ func (c *fakeClient) Download(ctx context.Context, id string, dst io.Writer) err
 	return err
 }
 func (c *fakeClient) Upload(_ context.Context, parentID, sourcePath string) (Item, error) {
-	documentID, err := validateRMDOC(sourcePath)
+	extension := strings.ToLower(strings.TrimPrefix(filepath.Ext(sourcePath), "."))
+	var documentID string
+	var err error
+	switch extension {
+	case "rmdoc":
+		documentID, err = validateRMDOC(sourcePath)
+	case "pdf":
+		err = validatePDF(sourcePath)
+		documentID = uuid.NewString()
+	case "epub":
+		err = validateEPUB(sourcePath)
+		documentID = uuid.NewString()
+	default:
+		err = fmt.Errorf("unsupported fake upload extension %q", extension)
+	}
 	if err != nil {
 		return Item{}, err
 	}
@@ -124,7 +139,7 @@ func (c *fakeClient) Upload(_ context.Context, parentID, sourcePath string) (Ite
 			return Item{}, err
 		}
 	}
-	name := strings.TrimSuffix(filepath.Base(sourcePath), ".rmdoc")
+	name := strings.TrimSuffix(filepath.Base(sourcePath), filepath.Ext(sourcePath))
 	item := Item{ID: documentID, Name: name, ParentID: parentID, Kind: ItemDocument, Version: 1}
 	if c.items == nil {
 		c.items = make(map[string]Item)

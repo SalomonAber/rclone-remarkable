@@ -7,7 +7,9 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -40,6 +42,97 @@ func TestPutCreatesValidatedRMDOC(t *testing.T) {
 	defer client.mu.Unlock()
 	if len(client.uploads) != 1 || filepath.Base(client.uploads[0].SourcePath) != "Meeting Notes 漢字.rmdoc" {
 		t.Fatalf("upload calls = %#v", client.uploads)
+	}
+}
+
+func TestPutImportsNativeDocuments(t *testing.T) {
+	tests := []struct {
+		name      string
+		remote    string
+		content   []byte
+		wantLocal string
+		wantExt   string
+	}{
+		{name: "PDF", remote: "Work/Quarterly Report.PDF", content: validPDF(), wantLocal: "Work/Quarterly Report.rmdoc", wantExt: ".pdf"},
+		{name: "EPUB", remote: "Work/An Excellent Book.epub", content: validEPUB(t), wantLocal: "Work/An Excellent Book.rmdoc", wantExt: ".epub"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			client := &fakeClient{items: map[string]Item{
+				"work": {ID: "work", Name: "Work", Kind: ItemDirectory},
+			}}
+			backend, err := newFs(ctx, "test", "", client, t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			src := object.NewStaticObjectInfo(test.remote, time.Now(), int64(len(test.content)), true, nil, backend)
+			uploaded, err := backend.Put(ctx, bytes.NewReader(test.content), src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := uploaded.(*Object)
+			if got.Remote() != test.wantLocal || got.item.Name != strings.TrimSuffix(path.Base(test.wantLocal), ".rmdoc") || got.item.ParentID != "work" {
+				t.Fatalf("uploaded object = %#v, remote = %q", got.item, got.Remote())
+			}
+			if got.Size() != -1 {
+				t.Fatalf("imported object size = %d, want unknown", got.Size())
+			}
+			client.mu.Lock()
+			defer client.mu.Unlock()
+			if len(client.uploads) != 1 || strings.ToLower(filepath.Ext(client.uploads[0].SourcePath)) != test.wantExt {
+				t.Fatalf("upload calls = %#v", client.uploads)
+			}
+		})
+	}
+}
+
+func TestPutRejectsInvalidNativeDocumentsBeforeUpload(t *testing.T) {
+	tests := []struct {
+		name    string
+		remote  string
+		content []byte
+	}{
+		{name: "invalid PDF", remote: "Broken.pdf", content: []byte("not a pdf")},
+		{name: "invalid EPUB", remote: "Broken.epub", content: invalidEPUB(t)},
+		{name: "unsupported extension", remote: "Notes.txt", content: []byte("notes")},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			client := &fakeClient{items: map[string]Item{}}
+			backend, err := newFs(ctx, "test", "", client, t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			src := object.NewStaticObjectInfo(test.remote, time.Now(), int64(len(test.content)), true, nil, backend)
+			if uploaded, err := backend.Put(ctx, bytes.NewReader(test.content), src); err == nil || uploaded != nil {
+				t.Fatalf("Put = (%v, %v), want validation error", uploaded, err)
+			}
+			if len(client.uploads) != 0 {
+				t.Fatalf("invalid import reached client: %#v", client.uploads)
+			}
+			assertUploadTempEmpty(t, backend.uploadTempDir)
+		})
+	}
+}
+
+func TestNativeImportChecksCanonicalRMDOCNameForCollision(t *testing.T) {
+	ctx := context.Background()
+	client := &fakeClient{items: map[string]Item{
+		"existing": {ID: "existing", Name: "Report", Kind: ItemDocument, Version: 1},
+	}}
+	backend, err := newFs(ctx, "test", "", client, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := validPDF()
+	src := object.NewStaticObjectInfo("Report.pdf", time.Now(), int64(len(content)), true, nil, backend)
+	if uploaded, err := backend.Put(ctx, bytes.NewReader(content), src); !errors.Is(err, errDestinationExists) || uploaded != nil {
+		t.Fatalf("collision Put = (%v, %v)", uploaded, err)
+	}
+	if len(client.uploads) != 0 {
+		t.Fatalf("collision invoked upload: %#v", client.uploads)
 	}
 }
 
@@ -201,6 +294,54 @@ func validRMDOC(t *testing.T, id string, payloadSize int64) []byte {
 	return buffer.Bytes()
 }
 
+func validPDF() []byte {
+	return []byte("%PDF-1.7\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF\n")
+}
+
+func validEPUB(t *testing.T) []byte {
+	t.Helper()
+	return epubArchive(t, true)
+}
+
+func invalidEPUB(t *testing.T) []byte {
+	t.Helper()
+	return epubArchive(t, false)
+}
+
+func epubArchive(t *testing.T, includeContainer bool) []byte {
+	t.Helper()
+	var buffer bytes.Buffer
+	writer := zip.NewWriter(&buffer)
+	mimetypeHeader := &zip.FileHeader{Name: "mimetype", Method: zip.Store}
+	mimetype, err := writer.CreateHeader(mimetypeHeader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mimetype.Write([]byte("application/epub+zip")); err != nil {
+		t.Fatal(err)
+	}
+	if includeContainer {
+		container, err := writer.Create("META-INF/container.xml")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := container.Write([]byte(`<?xml version="1.0"?><container><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	packageFile, err := writer.Create("OEBPS/content.opf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := packageFile.Write([]byte(`<?xml version="1.0"?><package/>`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buffer.Bytes()
+}
+
 func writeRMDOC(t *testing.T, filePath, id string, payloadSize int64) {
 	t.Helper()
 	file, err := os.Create(filePath)
@@ -267,6 +408,9 @@ func (zeroReader) Read(buffer []byte) (int, error) {
 func assertUploadTempEmpty(t *testing.T, tempRoot string) {
 	t.Helper()
 	entries, err := os.ReadDir(tempRoot)
+	if errors.Is(err, os.ErrNotExist) {
+		return
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
