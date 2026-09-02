@@ -397,8 +397,8 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, _ ...fs.O
 	item.ParentID = parentID
 	if extension != "rmdoc" {
 		// The VFS wrote the import-only source name (for example Report.pdf),
-		// while listings expose Report.rmdoc. Mark its parent stale now so the
-		// next directory read replaces the transient VFS entry immediately.
+		// while listings expose Report.pdf.rmdoc. Mark its parent stale now so
+		// the next directory read replaces the transient VFS entry immediately.
 		f.notifyChange(canonicalRemote, fs.EntryObject)
 	}
 	// rmapi synthesizes or normalizes the remote archive while importing, so
@@ -416,7 +416,11 @@ func importRemote(remote string) (canonicalRemote, extension string, err error) 
 		if path.Base(base) == "" || path.Base(base) == "." {
 			return "", "", fmt.Errorf("document visible name must not be empty")
 		}
-		return base + ".rmdoc", extension, nil
+		// Preserve the source format in the durable visible name. Besides making
+		// provenance clear, this prevents File.pdf and File.epub from both
+		// collapsing to File.rmdoc. Normalize the source suffix for canonical,
+		// case-insensitive names.
+		return base + "." + extension + ".rmdoc", extension, nil
 	default:
 		return "", "", fmt.Errorf("unsupported document import %q: destination must end in .pdf, .epub, or .rmdoc", remote)
 	}

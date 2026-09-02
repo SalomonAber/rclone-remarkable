@@ -57,8 +57,8 @@ func TestPutImportsNativeDocuments(t *testing.T) {
 		wantLocal string
 		wantExt   string
 	}{
-		{name: "PDF", remote: "Work/Quarterly Report.PDF", content: validPDF(), wantLocal: "Work/Quarterly Report.rmdoc", wantExt: ".pdf"},
-		{name: "EPUB", remote: "Work/An Excellent Book.epub", content: validEPUB(t), wantLocal: "Work/An Excellent Book.rmdoc", wantExt: ".epub"},
+		{name: "PDF", remote: "Work/Quarterly Report.PDF", content: validPDF(), wantLocal: "Work/Quarterly Report.pdf.rmdoc", wantExt: ".pdf"},
+		{name: "EPUB", remote: "Work/An Excellent Book.epub", content: validEPUB(t), wantLocal: "Work/An Excellent Book.epub.rmdoc", wantExt: ".epub"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -124,7 +124,7 @@ func TestPutRejectsInvalidNativeDocumentsBeforeUpload(t *testing.T) {
 func TestNativeImportChecksCanonicalRMDOCNameForCollision(t *testing.T) {
 	ctx := context.Background()
 	client := &fakeClient{items: map[string]Item{
-		"existing": {ID: "existing", Name: "Report", Kind: ItemDocument, Version: 1},
+		"existing": {ID: "existing", Name: "Report.pdf", Kind: ItemDocument, Version: 1},
 	}}
 	backend, err := newFs(ctx, "test", "", client, t.TempDir())
 	if err != nil {
@@ -140,6 +140,37 @@ func TestNativeImportChecksCanonicalRMDOCNameForCollision(t *testing.T) {
 	}
 }
 
+func TestNativeImportsWithSameBasenameRetainDistinctFormats(t *testing.T) {
+	ctx := context.Background()
+	client := &fakeClient{items: map[string]Item{}}
+	backend, err := newFs(ctx, "test", "", client, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	imports := []struct {
+		remote  string
+		content []byte
+	}{
+		{remote: "File.pdf", content: validPDF()},
+		{remote: "File.epub", content: validEPUB(t)},
+	}
+	for _, source := range imports {
+		src := object.NewStaticObjectInfo(source.remote, time.Now(), int64(len(source.content)), true, nil, backend)
+		if _, err := backend.Put(ctx, bytes.NewReader(source.content), src); err != nil {
+			t.Fatalf("import %q: %v", source.remote, err)
+		}
+	}
+	entries, err := backend.List(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertEntry(t, entries, "File.pdf.rmdoc", false)
+	assertEntry(t, entries, "File.epub.rmdoc", false)
+	if len(entries) != 2 {
+		t.Fatalf("root entries = %#v, want exactly the two distinct imports", entries)
+	}
+}
+
 func TestVFSDragAndDropCanonicalizesNativeDocumentAfterClose(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -147,8 +178,8 @@ func TestVFSDragAndDropCanonicalizesNativeDocumentAfterClose(t *testing.T) {
 		canonical string
 		content   []byte
 	}{
-		{name: "PDF", fileName: "Dragged Report.pdf", canonical: "Dragged Report.rmdoc", content: validPDF()},
-		{name: "EPUB", fileName: "Dragged Book.epub", canonical: "Dragged Book.rmdoc", content: validEPUB(t)},
+		{name: "PDF", fileName: "Dragged Report.pdf", canonical: "Dragged Report.pdf.rmdoc", content: validPDF()},
+		{name: "EPUB", fileName: "Dragged Book.epub", canonical: "Dragged Book.epub.rmdoc", content: validEPUB(t)},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
