@@ -261,6 +261,20 @@ func (f *Fs) notifyChange(remote string, entryType fs.EntryType) {
 	}
 }
 
+// notifyNativeImport invalidates the parent directory immediately and again
+// after Put has had time to unwind through VFS writeback. During Put, VFS still
+// considers the import-only source (for example Report.pdf) in use. A directory
+// read in that small window preserves the virtual source entry and consumes the
+// first invalidation, leaving both it and Report.pdf.rmdoc visible indefinitely.
+func (f *Fs) notifyNativeImport(remote string) {
+	f.notifyChange(remote, fs.EntryObject)
+	for _, delay := range []time.Duration{250 * time.Millisecond, time.Second} {
+		time.AfterFunc(delay, func() {
+			f.notifyChange(remote, fs.EntryObject)
+		})
+	}
+}
+
 func (f *Fs) notifyDirectoryTree(ctx context.Context, notifyFunc func(string, fs.EntryType)) {
 	notifyFunc("", fs.EntryDirectory)
 	seen := map[string]bool{f.rootID: true}
@@ -397,9 +411,9 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, _ ...fs.O
 	item.ParentID = parentID
 	if extension != "rmdoc" {
 		// The VFS wrote the import-only source name (for example Report.pdf),
-		// while listings expose Report.pdf.rmdoc. Mark its parent stale now so
-		// the next directory read replaces the transient VFS entry immediately.
-		f.notifyChange(canonicalRemote, fs.EntryObject)
+		// while listings expose Report.pdf.rmdoc. Mark its parent stale until
+		// VFS has finished releasing the transient source entry.
+		f.notifyNativeImport(canonicalRemote)
 	}
 	// rmapi synthesizes or normalizes the remote archive while importing, so
 	// its .rmdoc size is unknown until that representation is materialized.

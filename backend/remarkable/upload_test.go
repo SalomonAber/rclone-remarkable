@@ -243,6 +243,40 @@ func TestVFSDragAndDropCanonicalizesNativeDocumentAfterClose(t *testing.T) {
 	}
 }
 
+func TestNativeImportRenotifiesAfterVFSWriteback(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := &fakeClient{items: map[string]Item{}}
+	backend, err := newFs(ctx, "test", "", client, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	notifications := make(chan string, 3)
+	backend.ChangeNotify(ctx, func(remote string, entryType fs.EntryType) {
+		if entryType == fs.EntryObject {
+			notifications <- remote
+		}
+	}, make(chan time.Duration))
+
+	content := validPDF()
+	src := object.NewStaticObjectInfo("Report.pdf", time.Now(), int64(len(content)), true, nil, backend)
+	if _, err := backend.Put(ctx, bytes.NewReader(content), src); err != nil {
+		t.Fatal(err)
+	}
+
+	for index := 0; index < 3; index++ {
+		select {
+		case remote := <-notifications:
+			if remote != "Report.pdf.rmdoc" {
+				t.Fatalf("notification %d remote = %q", index, remote)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for notification %d", index)
+		}
+	}
+}
+
 func assertVFSNames(t *testing.T, mounted *vfs.VFS, dir string, want ...string) {
 	t.Helper()
 	entries, err := mounted.ReadDir(dir)
