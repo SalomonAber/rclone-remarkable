@@ -253,7 +253,7 @@ func (c *rmapiClient) List(_ context.Context, parentID string) ([]Item, error) {
 		// A metadata outage must not turn a healthy FUSE mount into an empty
 		// directory. refreshLocked retains c.tree on failure, so listings can
 		// continue from the last complete mirror while recovery is retried.
-		_, _ = c.refreshLocked(time.Now())
+		_, _ = c.refreshLocked(time.Now(), false)
 	}
 	parent := c.filetree().NodeById(parentID)
 	if parent == nil || !parent.IsDirectory() {
@@ -290,7 +290,7 @@ func (c *rmapiClient) Refresh(_ context.Context) (bool, error) {
 	defer rmapiHostMu.Unlock()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.refreshLocked(time.Now())
+	return c.refreshLocked(time.Now(), true)
 }
 
 const maxRefreshBackoff = time.Minute
@@ -302,7 +302,11 @@ func (c *rmapiClient) filetree() *filetree.FileTreeCtx {
 	return c.tree
 }
 
-func (c *rmapiClient) refreshLocked(now time.Time) (bool, error) {
+// refreshLocked mirrors the remote metadata. Only the notification path
+// advances the last-notified sync root: a refresh triggered by a listing must
+// not consume the change signal, or the next ChangeNotify poll reports no
+// change and nothing invalidates the VFS directory caches.
+func (c *rmapiClient) refreshLocked(now time.Time, notify bool) (bool, error) {
 	if now.Before(c.nextRefreshTry) {
 		return false, nil
 	}
@@ -326,6 +330,9 @@ func (c *rmapiClient) refreshLocked(now time.Time) (bool, error) {
 	c.lastRefresh = now
 	c.refreshFailures = 0
 	c.nextRefreshTry = time.Time{}
+	if !notify {
+		return false, nil
+	}
 	changed := !c.lastNotifySet || hash != c.lastNotifyHash || generation != c.lastNotifyGen
 	c.lastNotifyHash = hash
 	c.lastNotifyGen = generation

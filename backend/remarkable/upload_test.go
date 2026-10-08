@@ -16,6 +16,7 @@ import (
 	_ "github.com/rclone/rclone/backend/local"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
+	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/object"
 	"github.com/rclone/rclone/vfs"
 	"github.com/rclone/rclone/vfs/vfscommon"
@@ -140,6 +141,148 @@ func TestNativeImportChecksCanonicalRMDOCNameForCollision(t *testing.T) {
 	}
 }
 
+func TestRepeatedImportIsReportedAsAlreadyPublished(t *testing.T) {
+	tests := []struct {
+		name      string
+		remote    string
+		canonical string
+		content   []byte
+	}{
+		{name: "PDF", remote: "Work/Report.pdf", canonical: "Work/Report.pdf.rmdoc", content: validPDF()},
+		{name: "EPUB", remote: "Work/Book.epub", canonical: "Work/Book.epub.rmdoc", content: validEPUB(t)},
+		{name: "RMDOC", remote: "Work/Notes.rmdoc", canonical: "Work/Notes.rmdoc", content: validRMDOC(t, uploadDocumentID, 256)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			client := &fakeClient{items: map[string]Item{
+				"work": {ID: "work", Name: "Work", Kind: ItemDirectory},
+			}}
+			backend, err := newFs(ctx, "test", "", client, t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			src := object.NewStaticObjectInfo(test.remote, time.Now(), int64(len(test.content)), true, nil, backend)
+			first, err := backend.Put(ctx, bytes.NewReader(test.content), src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			repeat, err := backend.Put(ctx, bytes.NewReader(test.content), src)
+			if err != nil {
+				t.Fatalf("repeat import = %v, want the published document", err)
+			}
+			if repeat.Remote() != test.canonical {
+				t.Fatalf("repeat remote = %q, want %q", repeat.Remote(), test.canonical)
+			}
+			if repeat.(*Object).item.ID != first.(*Object).item.ID {
+				t.Fatalf("repeat UUID = %q, want %q", repeat.(*Object).item.ID, first.(*Object).item.ID)
+			}
+			if repeat.Size() != -1 {
+				t.Fatalf("repeat size = %d, want unknown", repeat.Size())
+			}
+			client.mu.Lock()
+			defer client.mu.Unlock()
+			if len(client.uploads) != 1 {
+				t.Fatalf("upload calls = %#v, want only the first import", client.uploads)
+			}
+			assertUploadTempEmpty(t, backend.uploadTempDir)
+		})
+	}
+}
+
+func TestRepeatedImportWithDifferentContentIsStillRefused(t *testing.T) {
+	tests := []struct {
+		name    string
+		remote  string
+		content []byte
+		changed []byte
+	}{
+		{
+			name:    "PDF",
+			remote:  "Report.pdf",
+			content: validPDF(),
+			changed: append(validPDF(), []byte("% revised\n")...),
+		},
+		{
+			name:    "RMDOC",
+			remote:  "Notes.rmdoc",
+			content: validRMDOC(t, uploadDocumentID, 256),
+			changed: validRMDOC(t, "6f1c2e04-9b3f-4c54-8a1e-90b0a2d7c511", 256),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			client := &fakeClient{items: map[string]Item{}}
+			backend, err := newFs(ctx, "test", "", client, t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			src := object.NewStaticObjectInfo(test.remote, time.Now(), int64(len(test.content)), true, nil, backend)
+			if _, err := backend.Put(ctx, bytes.NewReader(test.content), src); err != nil {
+				t.Fatal(err)
+			}
+			changedSrc := object.NewStaticObjectInfo(test.remote, time.Now(), int64(len(test.changed)), true, nil, backend)
+			uploaded, err := backend.Put(ctx, bytes.NewReader(test.changed), changedSrc)
+			if !errors.Is(err, errDestinationExists) || uploaded != nil {
+				t.Fatalf("changed repeat = (%v, %v), want a refused destination", uploaded, err)
+			}
+			client.mu.Lock()
+			defer client.mu.Unlock()
+			if len(client.uploads) != 1 {
+				t.Fatalf("upload calls = %#v, want only the first import", client.uploads)
+			}
+			assertUploadTempEmpty(t, backend.uploadTempDir)
+		})
+	}
+}
+
+// landedUploadClient commits the document but reports a retryable failure, as
+// rmapi does when a response is lost after the server accepted the import.
+type landedUploadClient struct {
+	Client
+	failures int
+}
+
+func (c *landedUploadClient) Upload(ctx context.Context, parentID, sourcePath string) (Item, error) {
+	item, err := c.Client.Upload(ctx, parentID, sourcePath)
+	if err != nil || c.failures == 0 {
+		return item, err
+	}
+	c.failures--
+	return Item{}, fserrors.RetryError(errors.New("connection reset by peer"))
+}
+
+func TestImportAdoptsDocumentThatLandedDespiteUploadError(t *testing.T) {
+	ctx := context.Background()
+	fake := &fakeClient{items: map[string]Item{
+		"work": {ID: "work", Name: "Work", Kind: ItemDirectory},
+	}}
+	client := &landedUploadClient{Client: fake, failures: 1}
+	backend, err := newFs(ctx, "test", "", client, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := validPDF()
+	src := object.NewStaticObjectInfo("Work/Report.pdf", time.Now(), int64(len(content)), true, nil, backend)
+	uploaded, err := backend.Put(ctx, bytes.NewReader(content), src)
+	if err != nil {
+		t.Fatalf("Put = %v, want the landed document to be adopted", err)
+	}
+	if uploaded.Remote() != "Work/Report.pdf.rmdoc" {
+		t.Fatalf("adopted remote = %q", uploaded.Remote())
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.uploads) != 1 {
+		t.Fatalf("upload calls = %#v, want the single landed import", fake.uploads)
+	}
+	if uploaded.(*Object).item.ID != fake.items[uploaded.(*Object).item.ID].ID {
+		t.Fatalf("adopted UUID %q is not published", uploaded.(*Object).item.ID)
+	}
+	assertUploadTempEmpty(t, backend.uploadTempDir)
+}
+
 func TestNativeImportsWithSameBasenameRetainDistinctFormats(t *testing.T) {
 	ctx := context.Background()
 	client := &fakeClient{items: map[string]Item{}}
@@ -240,6 +383,65 @@ func TestVFSDragAndDropCanonicalizesNativeDocumentAfterClose(t *testing.T) {
 				t.Fatalf("upload calls = %#v", client.uploads)
 			}
 		})
+	}
+}
+
+// A repeat copy is the common way a mount ends up showing both Report.pdf and
+// Report.pdf.rmdoc: rclone cannot match the import-only source against its
+// published representation, so it re-sends the document, and a refused
+// writeback leaves VFS retrying it with the source name still visible.
+func TestVFSRepeatedNativeImportStillCanonicalizesTheName(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := &fakeClient{items: map[string]Item{
+		"work": {ID: "work", Name: "Work", Kind: ItemDirectory},
+	}}
+	backend, err := newFs(ctx, "vfs-repeat-import", "", client, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	oldCacheDir := config.GetCacheDir()
+	if err := config.SetCacheDir(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := config.SetCacheDir(oldCacheDir); err != nil {
+			t.Errorf("restore cache directory: %v", err)
+		}
+	})
+
+	options := vfscommon.Opt
+	options.CacheMode = vfscommon.CacheModeFull
+	options.WriteBack = 0
+	options.PollInterval = 0
+	mounted := vfs.New(ctx, backend, &options)
+	t.Cleanup(func() {
+		mounted.WaitForWriters(5 * time.Second)
+		if err := mounted.CleanUp(); err != nil {
+			t.Errorf("clean up VFS: %v", err)
+		}
+		mounted.Shutdown()
+	})
+
+	content := validPDF()
+	for attempt := 1; attempt <= 2; attempt++ {
+		handle, err := mounted.OpenFile("Work/Report.pdf", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+		if err != nil {
+			t.Fatalf("attempt %d open: %v", attempt, err)
+		}
+		if _, err := handle.Write(content); err != nil {
+			t.Fatalf("attempt %d write: %v", attempt, err)
+		}
+		if err := handle.Close(); err != nil {
+			t.Fatalf("attempt %d close: %v", attempt, err)
+		}
+		assertVFSNames(t, mounted, "Work", "Report.pdf.rmdoc")
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.uploads) != 1 {
+		t.Fatalf("upload calls = %#v, want only the first import", client.uploads)
 	}
 }
 
@@ -559,6 +761,34 @@ type zeroReader struct{}
 func (zeroReader) Read(buffer []byte) (int, error) {
 	clear(buffer)
 	return len(buffer), nil
+}
+
+func TestReadersEqual(t *testing.T) {
+	block := bytes.Repeat([]byte("rmdoc payload "), 16<<10)
+	tests := []struct {
+		name        string
+		left, right []byte
+		want        bool
+	}{
+		{name: "empty", left: nil, right: nil, want: true},
+		{name: "equal below one buffer", left: block[:1024], right: block[:1024], want: true},
+		{name: "equal at the buffer boundary", left: block[:64<<10], right: block[:64<<10], want: true},
+		{name: "equal across buffers", left: block, right: block, want: true},
+		{name: "truncated at the buffer boundary", left: block[:64<<10], right: block[:(64<<10)-1], want: false},
+		{name: "extra buffer", left: block[:64<<10], right: block[:(64<<10)+1], want: false},
+		{name: "differs in a later buffer", left: block, right: append(append([]byte(nil), block[:len(block)-1]...), 'x'), want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := readersEqual(bytes.NewReader(test.left), bytes.NewReader(test.right))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != test.want {
+				t.Fatalf("readersEqual = %v, want %v", got, test.want)
+			}
+		})
+	}
 }
 
 func assertUploadTempEmpty(t *testing.T, tempRoot string) {

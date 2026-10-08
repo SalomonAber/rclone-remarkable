@@ -261,14 +261,28 @@ func (f *Fs) notifyChange(remote string, entryType fs.EntryType) {
 	}
 }
 
-// notifyNativeImport invalidates the parent directory immediately and again
-// after Put has had time to unwind through VFS writeback. During Put, VFS still
-// considers the import-only source (for example Report.pdf) in use. A directory
-// read in that small window preserves the virtual source entry and consumes the
-// first invalidation, leaving both it and Report.pdf.rmdoc visible indefinitely.
+// nativeImportNotifyDelays covers the whole window in which VFS can still
+// consider the import-only source in use, not just the first moments after Put.
+var nativeImportNotifyDelays = []time.Duration{
+	250 * time.Millisecond,
+	time.Second,
+	3 * time.Second,
+	10 * time.Second,
+	30 * time.Second,
+}
+
+// notifyNativeImport invalidates the parent directory immediately and then on a
+// decaying schedule. While the import-only source (for example Report.pdf) is
+// in use, a directory read preserves its virtual entry and consumes the
+// pending invalidation, so both it and Report.pdf.rmdoc stay visible until
+// --dir-cache-time expires. VFS holds that reference during Put and keeps it
+// for as long as anything else has the source open afterwards, which on a
+// desktop can be a thumbnailer or indexer reacting to the new file. Each repeat
+// only marks one directory stale, which is far cheaper than the stale listing
+// it prevents.
 func (f *Fs) notifyNativeImport(remote string) {
 	f.notifyChange(remote, fs.EntryObject)
-	for _, delay := range []time.Duration{250 * time.Millisecond, time.Second} {
+	for _, delay := range nativeImportNotifyDelays {
 		time.AfterFunc(delay, func() {
 			f.notifyChange(remote, fs.EntryObject)
 		})
@@ -370,12 +384,9 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, _ ...fs.O
 	if err != nil {
 		return nil, fserrors.NoRetryError(err)
 	}
-	parentID, visibleName, err := f.destination(ctx, canonicalRemote, ItemDocument, "")
-	if err != nil {
-		if errors.Is(err, errDestinationExists) {
-			return nil, fserrors.NoRetryError(err)
-		}
-		return nil, err
+	parentID, visibleName, conflict, destErr := f.resolveDestination(ctx, canonicalRemote, ItemDocument, "")
+	if destErr != nil && !errors.Is(destErr, errDestinationExists) {
+		return nil, destErr
 	}
 	var staged stagedDocument
 	if extension == "rmdoc" {
@@ -392,6 +403,9 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, _ ...fs.O
 		return nil, err
 	}
 	defer removeStagedDocument(staged.filePath)
+	if destErr != nil {
+		return f.adoptRepeatedImport(ctx, canonicalRemote, extension, staged, conflict, destErr)
+	}
 	if staged.documentID != "" {
 		if existing, getErr := f.client.Get(ctx, staged.documentID); getErr == nil {
 			return nil, fserrors.NoRetryError(fmt.Errorf("%w: UUID %q is already visible as %q", errDestinationExists, staged.documentID, localName(existing)))
@@ -402,7 +416,15 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, _ ...fs.O
 
 	item, err := f.client.Upload(ctx, parentID, staged.filePath)
 	if err != nil {
-		return nil, fmt.Errorf("upload %s: %w", extension, err)
+		landed, lookupErr := f.landedImport(ctx, parentID, visibleName, staged.documentID)
+		if lookupErr != nil {
+			fs.Errorf(f, "Could not check whether the failed %s import of %q landed: %v", extension, canonicalRemote, lookupErr)
+		}
+		if landed == nil {
+			return nil, fmt.Errorf("upload %s: %w", extension, err)
+		}
+		fs.Infof(f, "Import of %q reported %v but landed as UUID %q; adopting the published document", canonicalRemote, err, landed.ID)
+		item = *landed
 	}
 	if staged.documentID != "" && item.ID != staged.documentID {
 		return nil, fmt.Errorf("uploaded UUID %q does not match source UUID %q", item.ID, staged.documentID)
@@ -418,6 +440,81 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, _ ...fs.O
 	// rmapi synthesizes or normalizes the remote archive while importing, so
 	// its .rmdoc size is unknown until that representation is materialized.
 	return &Object{fs: f, remote: canonicalRemote, item: item, size: -1}, nil
+}
+
+// adoptRepeatedImport resolves an import whose visible name is already taken.
+// rclone cannot match an import-only source (Report.pdf) against its published
+// representation (Report.pdf.rmdoc), so every copy, sync, or drag-and-drop
+// re-sends a document that is already on the tablet. Refusing that outright
+// also wedges a mount: VFS retries the rejected writeback forever and leaves
+// the source name visible next to the .rmdoc. An identical repeat is therefore
+// reported as already done. A different payload is still refused, because
+// replacing a published document is not supported.
+func (f *Fs) adoptRepeatedImport(ctx context.Context, canonicalRemote, extension string, staged stagedDocument, conflict Item, destErr error) (fs.Object, error) {
+	if conflict.Kind != ItemDocument {
+		return nil, fserrors.NoRetryError(destErr)
+	}
+	same, err := f.importMatchesDocument(ctx, conflict, staged, extension)
+	if err != nil {
+		// Without the published payload there is no way to tell a repeat from a
+		// genuine collision, so keep refusing rather than report a document we
+		// could not verify as already imported.
+		fs.Errorf(f, "Could not compare %q against published UUID %q: %v", canonicalRemote, conflict.ID, err)
+		return nil, fserrors.NoRetryError(destErr)
+	}
+	if !same {
+		return nil, fserrors.NoRetryError(destErr)
+	}
+	fs.Infof(f, "%q is already published as UUID %q; skipping the duplicate upload", canonicalRemote, conflict.ID)
+	if extension != "rmdoc" {
+		f.notifyNativeImport(canonicalRemote)
+	}
+	// Report an unknown size for the same reason the upload path does: the
+	// published .rmdoc is not the source, so a known size here would trip
+	// rclone's post-transfer size check.
+	return &Object{fs: f, remote: canonicalRemote, item: conflict, size: -1}, nil
+}
+
+// importMatchesDocument reports whether a published document is the same
+// import as the freshly staged source. rmapi stores a PDF or EPUB source
+// verbatim inside the published .rmdoc as <uuid>.<ext>, so the comparison is
+// against that embedded payload. An .rmdoc source carries its own document
+// UUID, which identifies it directly; re-importing one UUID with changed
+// contents could not be applied anyway, since Update rejects replacement.
+func (f *Fs) importMatchesDocument(ctx context.Context, item Item, staged stagedDocument, extension string) (bool, error) {
+	if extension == "rmdoc" {
+		return staged.documentID != "" && staged.documentID == item.ID, nil
+	}
+	archivePath, _, err := f.cache.materialize(ctx, item)
+	if err != nil {
+		return false, err
+	}
+	return rmdocPayloadEqualsFile(archivePath, item.ID+"."+extension, staged.filePath, staged.size)
+}
+
+// landedImport reports the document an interrupted import created, if any.
+// rmapi can fail after the server has committed the upload, for example when
+// its response is lost. Leaving that unexamined wedges the import: the document
+// is on the tablet, every retry is refused as a duplicate destination, and a
+// mount keeps retrying the rejected writeback forever.
+func (f *Fs) landedImport(ctx context.Context, parentID, visibleName, documentID string) (*Item, error) {
+	if _, err := f.client.Refresh(ctx); err != nil {
+		return nil, err
+	}
+	items, err := f.client.List(ctx, parentID)
+	if err != nil {
+		return nil, err
+	}
+	for _, item := range items {
+		if item.Kind != ItemDocument || item.Name != visibleName {
+			continue
+		}
+		if documentID != "" && item.ID != documentID {
+			continue
+		}
+		return &item, nil
+	}
+	return nil, nil
 }
 
 func importRemote(remote string) (canonicalRemote, extension string, err error) {
@@ -640,6 +737,15 @@ func checkDuplicateNames(items []Item) error {
 }
 
 func (f *Fs) destination(ctx context.Context, remote string, kind ItemKind, sourceID string) (parentID, name string, err error) {
+	parentID, name, _, err = f.resolveDestination(ctx, remote, kind, sourceID)
+	return parentID, name, err
+}
+
+// resolveDestination validates a destination path and, when errDestinationExists
+// is returned, also reports the item occupying it along with the resolved parent
+// and visible name. An import needs those to tell a repeat of a document it
+// already published from a genuine collision with an unrelated one.
+func (f *Fs) resolveDestination(ctx context.Context, remote string, kind ItemKind, sourceID string) (parentID, name string, conflict Item, err error) {
 	remote = strings.Trim(remote, "/")
 	name = path.Base(remote)
 	parentRemote := path.Dir(remote)
@@ -647,33 +753,33 @@ func (f *Fs) destination(ctx context.Context, remote string, kind ItemKind, sour
 		parentRemote = ""
 	}
 	if name == "." || name == "" {
-		return "", "", fmt.Errorf("invalid destination %q", remote)
+		return "", "", Item{}, fmt.Errorf("invalid destination %q", remote)
 	}
 	if kind == ItemDocument {
 		if !strings.HasSuffix(name, ".rmdoc") {
-			return "", "", fmt.Errorf("document destination %q must end in .rmdoc", remote)
+			return "", "", Item{}, fmt.Errorf("document destination %q must end in .rmdoc", remote)
 		}
 		name = strings.TrimSuffix(name, ".rmdoc")
 		if name == "" {
-			return "", "", fmt.Errorf("document visible name must not be empty")
+			return "", "", Item{}, fmt.Errorf("document visible name must not be empty")
 		}
 	}
 	parent, err := f.resolve(ctx, f.rootID, parentRemote)
 	if errors.Is(err, fs.ErrorObjectNotFound) {
-		return "", "", fs.ErrorDirNotFound
+		return "", "", Item{}, fs.ErrorDirNotFound
 	}
 	if err != nil {
-		return "", "", err
+		return "", "", Item{}, err
 	}
 	if parent.Kind != ItemDirectory {
-		return "", "", fs.ErrorDirNotFound
+		return "", "", Item{}, fs.ErrorDirNotFound
 	}
 	items, err := f.client.List(ctx, parent.ID)
 	if err != nil {
-		return "", "", err
+		return "", "", Item{}, err
 	}
 	if err := checkDuplicateNames(items); err != nil {
-		return "", "", err
+		return "", "", Item{}, err
 	}
 	wanted := name
 	if kind == ItemDocument {
@@ -681,10 +787,10 @@ func (f *Fs) destination(ctx context.Context, remote string, kind ItemKind, sour
 	}
 	for _, item := range items {
 		if localName(item) == wanted && item.ID != sourceID {
-			return "", "", fmt.Errorf("%w: %q", errDestinationExists, remote)
+			return parent.ID, name, item, fmt.Errorf("%w: %q", errDestinationExists, remote)
 		}
 	}
-	return parent.ID, name, nil
+	return parent.ID, name, Item{}, nil
 }
 
 var (

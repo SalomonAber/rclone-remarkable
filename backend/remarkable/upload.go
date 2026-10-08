@@ -251,6 +251,66 @@ func validateRMDOC(filePath string) (string, error) {
 	return documentID, nil
 }
 
+// rmdocPayloadEqualsFile reports whether entryName inside the published .rmdoc
+// at archivePath is byte-identical to the staged source at filePath.
+func rmdocPayloadEqualsFile(archivePath, entryName, filePath string, size int64) (bool, error) {
+	archive, err := zip.OpenReader(archivePath)
+	if err != nil {
+		return false, fmt.Errorf("open published rmdoc %q: %w", archivePath, err)
+	}
+	defer archive.Close()
+
+	var payload *zip.File
+	for _, entry := range archive.File {
+		if entry.Name == entryName && !entry.FileInfo().IsDir() {
+			payload = entry
+			break
+		}
+	}
+	if payload == nil || size < 0 || payload.UncompressedSize64 != uint64(size) {
+		return false, nil
+	}
+
+	published, err := payload.Open()
+	if err != nil {
+		return false, fmt.Errorf("open rmdoc entry %q: %w", entryName, err)
+	}
+	defer published.Close()
+	source, err := os.Open(filePath)
+	if err != nil {
+		return false, err
+	}
+	defer source.Close()
+	return readersEqual(published, source)
+}
+
+func readersEqual(left, right io.Reader) (bool, error) {
+	leftBuffer := make([]byte, 64*1024)
+	rightBuffer := make([]byte, 64*1024)
+	atEnd := func(err error) bool {
+		return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
+	}
+	for {
+		leftRead, leftErr := io.ReadFull(left, leftBuffer)
+		rightRead, rightErr := io.ReadFull(right, rightBuffer)
+		if leftRead != rightRead || !bytes.Equal(leftBuffer[:leftRead], rightBuffer[:rightRead]) {
+			return false, nil
+		}
+		if leftErr == nil && rightErr == nil {
+			continue
+		}
+		if leftErr != nil && !atEnd(leftErr) {
+			return false, leftErr
+		}
+		if rightErr != nil && !atEnd(rightErr) {
+			return false, rightErr
+		}
+		// Equal-length reads plus a short read on either side means both
+		// streams ended here.
+		return true, nil
+	}
+}
+
 func removeStagedDocument(filePath string) {
 	if filePath != "" {
 		_ = os.RemoveAll(filepath.Dir(filePath))

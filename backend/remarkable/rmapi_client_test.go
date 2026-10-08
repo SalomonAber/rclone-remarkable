@@ -80,6 +80,36 @@ func TestRMAPIRefreshDetectsSyncRootChanges(t *testing.T) {
 	}
 }
 
+// A listing refreshes the metadata mirror on its own schedule. If that also
+// advanced the last-notified sync root, the next ChangeNotify poll would report
+// no change and nothing would invalidate the VFS directory caches, so remote
+// changes would stay hidden until --dir-cache-time expired.
+func TestRMAPIListRefreshDoesNotConsumeTheChangeNotification(t *testing.T) {
+	tree := filetree.CreateFileTreeCtx()
+	api := &fakeAPICtx{tree: &tree, refreshHash: "hash-1", refreshGeneration: 1}
+	client := &rmapiClient{api: api, tree: &tree, refreshInterval: time.Millisecond, lastRefresh: time.Now().Add(-time.Hour)}
+
+	if _, err := client.List(context.Background(), ""); err != nil {
+		t.Fatal(err)
+	}
+	if api.refreshCalls != 1 {
+		t.Fatalf("listing refresh calls = %d, want one", api.refreshCalls)
+	}
+	changed, err := client.Refresh(context.Background())
+	if err != nil || !changed {
+		t.Fatalf("first notified refresh = changed %v, error %v; want changed", changed, err)
+	}
+
+	api.refreshGeneration++
+	if _, err := client.List(context.Background(), ""); err != nil {
+		t.Fatal(err)
+	}
+	changed, err = client.Refresh(context.Background())
+	if err != nil || !changed {
+		t.Fatalf("notified refresh after a listing = changed %v, error %v; want changed", changed, err)
+	}
+}
+
 func TestRMAPIListPreservesTreeAndRecreatesClientAfterRefreshFailure(t *testing.T) {
 	oldTree := filetree.CreateFileTreeCtx()
 	oldTree.AddDocument(&model.Document{ID: "old", Name: "Last successful", Type: model.DirectoryType})

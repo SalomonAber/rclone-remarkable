@@ -147,7 +147,13 @@ func (c *fakeClient) Upload(_ context.Context, parentID, sourcePath string) (Ite
 	if extension == "rmdoc" {
 		remoteContent, err = os.ReadFile(sourcePath)
 	} else {
-		remoteContent, err = fakeRMDOC(documentID)
+		// rmapi stores a PDF or EPUB source verbatim as <uuid>.<ext> inside
+		// the published document, so the fake must too.
+		var payload []byte
+		payload, err = os.ReadFile(sourcePath)
+		if err == nil {
+			remoteContent, err = fakeRMDOC(documentID, documentID+"."+extension, payload)
+		}
 	}
 	if err != nil {
 		return Item{}, err
@@ -175,9 +181,18 @@ func (c *fakeClient) Upload(_ context.Context, parentID, sourcePath string) (Ite
 	return item, nil
 }
 
-func fakeRMDOC(documentID string) ([]byte, error) {
+func fakeRMDOC(documentID, payloadName string, payload []byte) ([]byte, error) {
 	var buffer bytes.Buffer
 	writer := zip.NewWriter(&buffer)
+	if payloadName != "" {
+		entry, err := writer.Create(payloadName)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := entry.Write(payload); err != nil {
+			return nil, err
+		}
+	}
 	metadata, err := writer.Create(documentID + ".metadata")
 	if err != nil {
 		return nil, err
