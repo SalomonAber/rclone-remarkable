@@ -60,6 +60,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		_ = file.Close()
 		return nil, err
 	}
+	fs.Debugf(o, "Reading UUID %q from %q at offset %d limit %d", o.item.ID, cachePath, offset, limit)
 	if limit >= 0 {
 		return struct {
 			io.Reader
@@ -72,6 +73,7 @@ func (o *Object) Update(context.Context, io.Reader, fs.ObjectInfo, ...fs.OpenOpt
 	return fserrors.NoRetryError(fmt.Errorf("%w: replacing an existing compound .rmdoc is not supported", fs.ErrorNotImplemented))
 }
 func (o *Object) Remove(ctx context.Context) error {
+	fs.Debugf(o, "Removing UUID %q", o.item.ID)
 	return o.fs.client.Remove(ctx, o.item.ID)
 }
 

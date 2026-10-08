@@ -161,9 +161,11 @@ func newFs(ctx context.Context, name, root string, client Client, cacheDir strin
 		rootItem, err := f.resolve(ctx, "", f.root)
 		if errors.Is(err, fs.ErrorObjectNotFound) {
 			f.rootMissing = true
+			fs.Debugf(f, "Root does not exist yet; it is created on the first write")
 		} else if err != nil {
 			return nil, err
 		} else if rootItem.Kind != ItemDirectory {
+			fs.Debugf(f, "Root is document UUID %q; continuing from its parent", rootItem.ID)
 			parentRoot := path.Dir(f.root)
 			if parentRoot == "." {
 				parentRoot = ""
@@ -173,6 +175,7 @@ func newFs(ctx context.Context, name, root string, client Client, cacheDir strin
 			rootErr = fs.ErrorIsFile
 		} else {
 			f.rootID = rootItem.ID
+			fs.Debugf(f, "Root resolved to UUID %q", rootItem.ID)
 		}
 	}
 	f.features = (&fs.Features{
@@ -202,6 +205,7 @@ func (f *Fs) ChangeNotify(ctx context.Context, notifyFunc func(string, fs.EntryT
 	f.notifyNextID++
 	f.notifiers[notifierID] = notifyFunc
 	f.notifyMu.Unlock()
+	fs.Debugf(f, "ChangeNotify notifier %d registered", notifierID)
 
 	go func() {
 		var ticker *time.Ticker
@@ -213,6 +217,7 @@ func (f *Fs) ChangeNotify(ctx context.Context, notifyFunc func(string, fs.EntryT
 			f.notifyMu.Lock()
 			delete(f.notifiers, notifierID)
 			f.notifyMu.Unlock()
+			fs.Debugf(f, "ChangeNotify notifier %d stopped", notifierID)
 		}()
 
 		for {
@@ -228,6 +233,9 @@ func (f *Fs) ChangeNotify(ctx context.Context, notifyFunc func(string, fs.EntryT
 				if interval > 0 {
 					ticker = time.NewTicker(interval)
 					tickerC = ticker.C
+					fs.Debugf(f, "ChangeNotify polling every %s", interval)
+				} else {
+					fs.Debugf(f, "ChangeNotify polling disabled")
 				}
 			case <-tickerC:
 				changed, err := f.client.Refresh(ctx)
@@ -236,6 +244,7 @@ func (f *Fs) ChangeNotify(ctx context.Context, notifyFunc func(string, fs.EntryT
 					continue
 				}
 				if changed {
+					fs.Debugf(f, "Remote sync root changed; invalidating the mounted directory tree")
 					f.notifyDirectoryTree(ctx, notifyFunc)
 				}
 			case <-ctx.Done():
@@ -256,6 +265,7 @@ func (f *Fs) notifyChange(remote string, entryType fs.EntryType) {
 		notifiers = append(notifiers, notify)
 	}
 	f.notifyMu.Unlock()
+	fs.Debugf(f, "Invalidating %q for %d VFS notifier(s)", remote, len(notifiers))
 	for _, notify := range notifiers {
 		notify(remote, entryType)
 	}
@@ -281,6 +291,7 @@ var nativeImportNotifyDelays = []time.Duration{
 // only marks one directory stale, which is far cheaper than the stale listing
 // it prevents.
 func (f *Fs) notifyNativeImport(remote string) {
+	fs.Debugf(f, "Repeating the invalidation of %q at %v after the native import", remote, nativeImportNotifyDelays)
 	f.notifyChange(remote, fs.EntryObject)
 	for _, delay := range nativeImportNotifyDelays {
 		time.AfterFunc(delay, func() {
@@ -310,6 +321,7 @@ func (f *Fs) notifyDirectoryTree(ctx context.Context, notifyFunc func(string, fs
 		}
 	}
 	walk(f.rootID, "")
+	fs.Debugf(f, "Invalidated the root and %d subdirectories", len(seen)-1)
 }
 
 func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
@@ -350,6 +362,7 @@ func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
 		}
 		entries = append(entries, object)
 	}
+	fs.Debugf(f, "Listed %d entries in %q (UUID %q)", len(entries), dir, directory.ID)
 	return entries, nil
 }
 
@@ -384,6 +397,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, _ ...fs.O
 	if err != nil {
 		return nil, fserrors.NoRetryError(err)
 	}
+	fs.Debugf(f, "Importing %s source %q as %q", extension, src.Remote(), canonicalRemote)
 	parentID, visibleName, conflict, destErr := f.resolveDestination(ctx, canonicalRemote, ItemDocument, "")
 	if destErr != nil && !errors.Is(destErr, errDestinationExists) {
 		return nil, destErr
@@ -403,6 +417,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, _ ...fs.O
 		return nil, err
 	}
 	defer removeStagedDocument(staged.filePath)
+	fs.Debugf(f, "Staged %s source of %q (%d bytes, embedded UUID %q)", extension, canonicalRemote, staged.size, staged.documentID)
 	if destErr != nil {
 		return f.adoptRepeatedImport(ctx, canonicalRemote, extension, staged, conflict, destErr)
 	}
@@ -421,6 +436,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, _ ...fs.O
 			fs.Errorf(f, "Could not check whether the failed %s import of %q landed: %v", extension, canonicalRemote, lookupErr)
 		}
 		if landed == nil {
+			fs.Debugf(f, "No published document matches the failed %s import of %q; reporting the upload error", extension, canonicalRemote)
 			return nil, fmt.Errorf("upload %s: %w", extension, err)
 		}
 		fs.Infof(f, "Import of %q reported %v but landed as UUID %q; adopting the published document", canonicalRemote, err, landed.ID)
@@ -431,6 +447,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, _ ...fs.O
 	}
 	item.Name = visibleName
 	item.ParentID = parentID
+	fs.Debugf(f, "Imported %q as UUID %q version %d", canonicalRemote, item.ID, item.Version)
 	if extension != "rmdoc" {
 		// The VFS wrote the import-only source name (for example Report.pdf),
 		// while listings expose Report.pdf.rmdoc. Mark its parent stale until
@@ -452,8 +469,10 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, _ ...fs.O
 // replacing a published document is not supported.
 func (f *Fs) adoptRepeatedImport(ctx context.Context, canonicalRemote, extension string, staged stagedDocument, conflict Item, destErr error) (fs.Object, error) {
 	if conflict.Kind != ItemDocument {
+		fs.Debugf(f, "Refusing the import of %q: collection UUID %q occupies that name", canonicalRemote, conflict.ID)
 		return nil, fserrors.NoRetryError(destErr)
 	}
+	fs.Debugf(f, "%q is occupied by UUID %q; checking whether this import is a repeat", canonicalRemote, conflict.ID)
 	same, err := f.importMatchesDocument(ctx, conflict, staged, extension)
 	if err != nil {
 		// Without the published payload there is no way to tell a repeat from a
@@ -463,6 +482,7 @@ func (f *Fs) adoptRepeatedImport(ctx context.Context, canonicalRemote, extension
 		return nil, fserrors.NoRetryError(destErr)
 	}
 	if !same {
+		fs.Debugf(f, "Refusing the import of %q: published UUID %q holds a different payload", canonicalRemote, conflict.ID)
 		return nil, fserrors.NoRetryError(destErr)
 	}
 	fs.Infof(f, "%q is already published as UUID %q; skipping the duplicate upload", canonicalRemote, conflict.ID)
@@ -551,6 +571,7 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 	if errors.Is(err, errDestinationExists) {
 		item, resolveErr := f.resolve(ctx, f.rootID, dir)
 		if resolveErr == nil && item.Kind == ItemDirectory {
+			fs.Debugf(f, "Collection %q already exists as UUID %q", dir, item.ID)
 			return nil
 		}
 		return err
@@ -589,6 +610,7 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	if len(children) != 0 {
 		return fs.ErrorDirectoryNotEmpty
 	}
+	fs.Debugf(f, "Removing empty collection %q (UUID %q)", dir, item.ID)
 	return f.client.Remove(ctx, item.ID)
 }
 
@@ -625,6 +647,7 @@ func (f *Fs) ensureRoot(ctx context.Context, create bool) error {
 	}
 	f.rootID = current.ID
 	f.rootMissing = false
+	fs.Debugf(f, "Root is now UUID %q", current.ID)
 	return nil
 }
 
@@ -642,6 +665,7 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	if err != nil {
 		return nil, err
 	}
+	fs.Debugf(f, "Moved %q to %q (UUID %q)", srcObject.remote, remote, item.ID)
 	size := srcObject.size
 	if info, promoted, err := f.cache.promoteMetadata(srcObject.item, item); err != nil {
 		fs.Errorf(srcObject, "Failed to promote cached metadata: %v", err)
@@ -677,8 +701,11 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	if err != nil {
 		return err
 	}
-	_, err = f.client.Move(ctx, item.ID, parentID, name)
-	return err
+	if _, err = f.client.Move(ctx, item.ID, parentID, name); err != nil {
+		return err
+	}
+	fs.Debugf(f, "Moved collection %q to %q (UUID %q)", srcRemote, dstRemote, item.ID)
+	return nil
 }
 
 func (f *Fs) newObject(ctx context.Context, remote string, item Item) (*Object, error) {

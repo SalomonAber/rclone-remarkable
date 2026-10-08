@@ -19,6 +19,7 @@ import (
 	"github.com/juruen/rmapi/filetree"
 	"github.com/juruen/rmapi/model"
 	"github.com/juruen/rmapi/transport"
+	"github.com/rclone/rclone/fs"
 	"gopkg.in/yaml.v2"
 )
 
@@ -85,6 +86,10 @@ type rmapiClient struct {
 // in-flight or subsequent request from a different client at the wrong host.
 var rmapiHostMu sync.Mutex
 
+// String identifies the client in log messages. rmapi's endpoints are
+// process-global, so the configured host is what distinguishes two clients.
+func (c *rmapiClient) String() string { return fmt.Sprintf("rmapi client for %s", c.host) }
+
 func newRMAPIClient(api rmapi.ApiCtx, host string, refreshInterval time.Duration) Client {
 	return &rmapiClient{api: api, tree: api.Filetree(), host: host, refreshInterval: refreshInterval, lastRefresh: time.Now()}
 }
@@ -141,6 +146,7 @@ func NewConfiguredRMAPIClient(opt Options, metadataCacheRoot string) (Client, er
 	}
 	client := newRMAPIClient(apiCtx, opt.Host, refreshInterval).(*rmapiClient)
 	client.recreate = recreate
+	fs.Debugf(client, "Initialized rmapi sync client (metadata cache %q, fallback refresh interval %s)", metadataCacheDir, refreshInterval)
 	return client, nil
 }
 
@@ -153,6 +159,7 @@ func createRMAPIContextWithRefresh(httpCtx *transport.HttpClientCtx, options rma
 		return nil, "", errors.New("user token expired and no device token is available; device re-registration is required")
 	}
 
+	fs.Debugf(nil, "Configured user token was rejected; requesting a replacement with the device token")
 	userToken, err := refreshRMAPIUserToken(httpCtx)
 	if errors.Is(err, transport.ErrUnauthorized) {
 		return nil, "", errors.New("device token was rejected; device re-registration is required")
@@ -168,6 +175,9 @@ func createRMAPIContextWithRefresh(httpCtx *transport.HttpClientCtx, options rma
 	apiCtx, err = createRMAPIContext(httpCtx, rmapi.Version15, options)
 	if errors.Is(err, transport.ErrUnauthorized) {
 		return nil, "", errors.New("refreshed user token was rejected")
+	}
+	if err == nil {
+		fs.Debugf(nil, "Replacement user token was accepted")
 	}
 	return apiCtx, userToken, err
 }
@@ -253,7 +263,11 @@ func (c *rmapiClient) List(_ context.Context, parentID string) ([]Item, error) {
 		// A metadata outage must not turn a healthy FUSE mount into an empty
 		// directory. refreshLocked retains c.tree on failure, so listings can
 		// continue from the last complete mirror while recovery is retried.
-		_, _ = c.refreshLocked(time.Now(), false)
+		// The error is deliberately not propagated, so record it here: it is
+		// otherwise the only sign that a mount is serving stale metadata.
+		if _, err := c.refreshLocked(time.Now(), false); err != nil {
+			fs.Debugf(c, "Serving the listing of %q from the last complete mirror: %v", parentID, err)
+		}
 	}
 	parent := c.filetree().NodeById(parentID)
 	if parent == nil || !parent.IsDirectory() {
@@ -308,11 +322,13 @@ func (c *rmapiClient) filetree() *filetree.FileTreeCtx {
 // change and nothing invalidates the VFS directory caches.
 func (c *rmapiClient) refreshLocked(now time.Time, notify bool) (bool, error) {
 	if now.Before(c.nextRefreshTry) {
+		fs.Debugf(c, "Holding off the metadata refresh for another %s after %d consecutive failures", c.nextRefreshTry.Sub(now).Round(time.Millisecond), c.refreshFailures)
 		return false, nil
 	}
 
 	apiCtx := c.api
 	if c.refreshFailures > 0 && c.recreate != nil {
+		fs.Debugf(c, "Recreating the rmapi client after %d consecutive refresh failures", c.refreshFailures)
 		var err error
 		apiCtx, err = c.recreate()
 		if err != nil {
@@ -323,6 +339,9 @@ func (c *rmapiClient) refreshLocked(now time.Time, notify bool) (bool, error) {
 	if err != nil {
 		return false, c.refreshFailed(now, err)
 	}
+	if c.refreshFailures > 0 {
+		fs.Debugf(c, "Metadata refresh recovered after %d consecutive failures", c.refreshFailures)
+	}
 	// Publish the replacement client and tree only after its complete mirror
 	// succeeds. In particular, never publish a partially cleared rmapi tree.
 	c.api = apiCtx
@@ -331,12 +350,14 @@ func (c *rmapiClient) refreshLocked(now time.Time, notify bool) (bool, error) {
 	c.refreshFailures = 0
 	c.nextRefreshTry = time.Time{}
 	if !notify {
+		fs.Debugf(c, "Refreshed metadata for a listing (sync root %q generation %d)", hash, generation)
 		return false, nil
 	}
 	changed := !c.lastNotifySet || hash != c.lastNotifyHash || generation != c.lastNotifyGen
 	c.lastNotifyHash = hash
 	c.lastNotifyGen = generation
 	c.lastNotifySet = true
+	fs.Debugf(c, "Refreshed metadata for polling (sync root %q generation %d, changed %v)", hash, generation, changed)
 	return changed, nil
 }
 
@@ -379,6 +400,7 @@ func (c *rmapiClient) Download(_ context.Context, id string, dst io.Writer) erro
 	}
 	defer os.Remove(name)
 
+	fs.Debugf(c, "Fetching document %q", id)
 	if err := c.api.FetchDocument(id, name); err != nil {
 		return err
 	}
@@ -387,8 +409,12 @@ func (c *rmapiClient) Download(_ context.Context, id string, dst io.Writer) erro
 		return err
 	}
 	defer src.Close()
-	_, err = io.Copy(dst, src)
-	return err
+	written, err := io.Copy(dst, src)
+	if err != nil {
+		return err
+	}
+	fs.Debugf(c, "Fetched document %q (%d bytes)", id, written)
+	return nil
 }
 
 func (c *rmapiClient) Upload(_ context.Context, parentID, sourcePath string) (Item, error) {
@@ -397,11 +423,13 @@ func (c *rmapiClient) Upload(_ context.Context, parentID, sourcePath string) (It
 	defer rmapiHostMu.Unlock()
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	fs.Debugf(c, "Uploading %q into parent %q", filepath.Base(sourcePath), parentID)
 	doc, err := c.api.UploadDocument(parentID, sourcePath, true, nil, nil, nil, nil)
 	if err != nil {
 		return Item{}, err
 	}
 	c.filetree().AddDocument(doc)
+	fs.Debugf(c, "Uploaded %q as UUID %q version %d", filepath.Base(sourcePath), doc.ID, doc.Version)
 	return itemFromDocument(doc)
 }
 
@@ -421,6 +449,7 @@ func (c *rmapiClient) Move(_ context.Context, id, parentID, name string) (Item, 
 		return Item{}, err
 	}
 	c.filetree().MoveNode(src, node)
+	fs.Debugf(c, "Moved UUID %q into parent %q as %q", id, parentID, name)
 	return itemFromNode(node)
 }
 
@@ -435,6 +464,7 @@ func (c *rmapiClient) Mkdir(_ context.Context, parentID, name string) (Item, err
 		return Item{}, err
 	}
 	c.filetree().AddDocument(doc)
+	fs.Debugf(c, "Created collection %q in parent %q as UUID %q", name, parentID, doc.ID)
 	return itemFromDocument(doc)
 }
 
@@ -452,6 +482,7 @@ func (c *rmapiClient) Remove(_ context.Context, id string) error {
 		return err
 	}
 	c.filetree().DeleteNode(node)
+	fs.Debugf(c, "Removed UUID %q", id)
 	return nil
 }
 

@@ -11,6 +11,7 @@ import (
 	"strconv"
 
 	rmarchive "github.com/juruen/rmapi/archive"
+	"github.com/rclone/rclone/fs"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -24,6 +25,9 @@ type contentCache struct {
 func newContentCache(dir string, client Client) *contentCache {
 	return &contentCache{dir: dir, client: client}
 }
+
+// String identifies the cache in log messages; it has no Fs to borrow a name from.
+func (c *contentCache) String() string { return "reMarkable content cache" }
 
 func (c *contentCache) path(item Item) (string, error) {
 	if item.ID == "" || item.ID == "." || filepath.Base(item.ID) != item.ID {
@@ -44,10 +48,12 @@ func (c *contentCache) materialize(ctx context.Context, item Item) (string, os.F
 
 	value, err, _ := materializations.Do(cachePath, func() (any, error) {
 		if info, err := os.Stat(cachePath); err == nil {
+			fs.Debugf(c, "Document %q version %d is already cached (%d bytes)", item.ID, item.Version, info.Size())
 			return info, nil
 		} else if !os.IsNotExist(err) {
 			return nil, err
 		}
+		fs.Debugf(c, "Materializing document %q version %d into %q", item.ID, item.Version, cachePath)
 
 		dir := filepath.Dir(cachePath)
 		if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -79,7 +85,11 @@ func (c *contentCache) materialize(ctx context.Context, item Item) (string, os.F
 			return nil, err
 		}
 		committed = true
-		return os.Stat(cachePath)
+		info, err := os.Stat(cachePath)
+		if err == nil {
+			fs.Debugf(c, "Materialized document %q version %d (%d bytes)", item.ID, item.Version, info.Size())
+		}
+		return info, err
 	})
 	if err != nil {
 		return "", nil, err
@@ -97,11 +107,13 @@ func (c *contentCache) promoteMetadata(oldItem, newItem Item) (os.FileInfo, bool
 		return nil, false, err
 	}
 	if info, err := os.Stat(newPath); err == nil {
+		fs.Debugf(c, "Document %q is already cached under its new metadata", newItem.ID)
 		return info, true, nil
 	} else if !os.IsNotExist(err) {
 		return nil, false, err
 	}
 	if _, err := os.Stat(oldPath); os.IsNotExist(err) {
+		fs.Debugf(c, "Document %q has no cached archive to promote", newItem.ID)
 		return nil, false, nil
 	} else if err != nil {
 		return nil, false, err
@@ -113,6 +125,7 @@ func (c *contentCache) promoteMetadata(oldItem, newItem Item) (os.FileInfo, bool
 	if err != nil {
 		return nil, false, err
 	}
+	fs.Debugf(c, "Promoted the cached archive of document %q to version %d", newItem.ID, newItem.Version)
 	return value.(os.FileInfo), true, nil
 }
 

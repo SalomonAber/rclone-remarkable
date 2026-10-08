@@ -247,6 +247,18 @@ Copying a new PDF, EPUB, or valid `.rmdoc` into the mount is supported. While a 
 
 The import filename is a virtual VFS entry, which VFS only drops while the file is not in use and only when it re-reads the directory. A listing that lands while the entry is still held both keeps it and consumes the pending invalidation, which would otherwise leave the import filename beside the canonical `.rmdoc` until `--dir-cache-time` expires. The backend therefore repeats the invalidation on a decaying schedule out to 30 seconds; each repeat only marks one directory stale. A refused import is the other way the import filename persists, because rclone's VFS retries a rejected writeback indefinitely with no way for a backend to withdraw it — hence the idempotent-import handling described under [Document creation](#document-creation).
 
+## Diagnostics
+
+Running any command with `-vv` (`--log-level DEBUG`) traces the decisions that are otherwise invisible from the mount, because the backend hides most of them behind retained state or a returned-but-discarded error:
+
+- client lifecycle: resolved root UUID, deferred root creation, initialized sync client with its metadata cache directory and fallback refresh interval, and a rejected user token being replaced from the device token.
+- metadata refresh: every refresh with its sync root hash and generation, whether polling considered it a change, the backoff window after a failure, each rmapi client recreation, and recovery after consecutive failures. A listing that falls back to the last complete mirror reports the refresh error here; that error is intentionally not propagated, so this is the only sign that a mount is serving stale metadata.
+- VFS invalidation: notifier registration and shutdown, the effective poll interval, the number of directories invalidated after a remote change, and each invalidation with the number of notifiers that received it, including the repeats scheduled after a native import.
+- imports: the canonical destination name, the staged source size and embedded UUID, the published UUID, whether a name collision was recognized as an idempotent repeat or refused, and whether a failed upload was found to have landed.
+- content cache: cache hits, materializations with their resulting size, and metadata promotions after a move.
+
+Document names, remote paths, UUIDs, and cache paths appear in these lines; tokens and certificates never do.
+
 ## Compatibility Notes
 
 - rmapi's endpoint URLs are package-global values. The backend serializes network operations and reapplies each client's `host`, so different `remarkable` hosts can safely coexist in one rclone process at the cost of serialized rmapi requests.
