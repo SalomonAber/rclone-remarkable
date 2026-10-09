@@ -16,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 	rmarchive "github.com/juruen/rmapi/archive"
+	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/lib/readers"
 )
 
@@ -79,6 +80,15 @@ func stageDocument(ctx context.Context, in io.Reader, tempRoot, visibleName, ext
 	if err != nil {
 		return stagedDocument{}, fmt.Errorf("stage %s: %w", extension, err)
 	}
+	if staged.size == 0 {
+		// No document format is valid at zero bytes, and the usual source of
+		// one is an application that creates the destination empty and fills
+		// it later by renaming its own temporary file over it. Report the
+		// condition rclone has a sentinel for instead of a corrupt-document
+		// error, so VFS logs it and moves on rather than failing the close.
+		err = fmt.Errorf("empty %s source: %w", extension, fs.ErrorCantUploadEmptyFiles)
+		return stagedDocument{}, err
+	}
 	staged.documentID, err = validate(staged.filePath)
 	if err != nil {
 		return stagedDocument{}, fmt.Errorf("%w: %v", validationError, err)
@@ -94,7 +104,7 @@ func validatePDF(filePath string) error {
 	defer file.Close()
 	header := make([]byte, 1024)
 	n, err := io.ReadFull(file, header)
-	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) {
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
 		return err
 	}
 	if !bytes.Contains(header[:n], []byte("%PDF-")) {

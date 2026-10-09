@@ -64,7 +64,7 @@ You need a running rmfakecloud instance and an rmapi YAML file containing `devic
 	      "config=/etc/rclone-remarkable.conf"
 	      "cache_dir=/var/cache/rclone/remarkable"
 	      "vfs_cache_mode=full"
-	      "vfs_write_back=0s"
+	      "vfs_write_back=5s"
 	      "dir_cache_time=30s"
 	      "poll_interval=30s"
 	      "attr_timeout=1s"
@@ -232,18 +232,32 @@ RCLONE_REMARKABLE_REFRESH_INTERVAL=30s \
 	:remarkable,host=http://127.0.0.1:7632: \
 	/tmp/remarkable \
 	--vfs-cache-mode full \
-	--vfs-write-back 0s \
+	--vfs-write-back 5s \
 	--cache-dir /tmp/rclone-remarkable-cache \
 	--dir-cache-time 30s \
 	--poll-interval 30s \
 	--attr-timeout 1s
 ```
 
-Use an absolute persistent `--cache-dir` for normal operation. `full` mode gives editors and other POSIX applications stable local seek/read behavior; `--vfs-write-back 0s` starts remote creation as soon as a new file closes. `--poll-interval` enables automatic rmapi metadata refresh and invalidates VFS directory caches when the remote sync root changes, so changes made on the tablet or by another client become visible without waiting for `--dir-cache-time`. Only that poll advances the last-notified sync root; the independent `refresh_interval` refresh a listing performs deliberately does not, or it would consume the change signal and the next poll would report nothing to invalidate. A zero poll interval disables automatic refresh; `refresh_interval` remains a fallback for direct listings and non-mount commands. Successful mutations update rmapi's in-process tree immediately.
+Use an absolute persistent `--cache-dir` for normal operation. `full` mode gives editors and other POSIX applications stable local seek/read behavior; a non-zero `--vfs-write-back` keeps the import asynchronous, which is required for applications that write a payload under a temporary name and rename it into place (see [Writeback delay](#writeback-delay)). `--poll-interval` enables automatic rmapi metadata refresh and invalidates VFS directory caches when the remote sync root changes, so changes made on the tablet or by another client become visible without waiting for `--dir-cache-time`. Only that poll advances the last-notified sync root; the independent `refresh_interval` refresh a listing performs deliberately does not, or it would consume the change signal and the next poll would report nothing to invalidate. A zero poll interval disables automatic refresh; `refresh_interval` remains a fallback for direct listings and non-mount commands. Successful mutations update rmapi's in-process tree immediately.
 
 The backend content cache remains keyed by UUID and remote version beneath `<cache-dir>/remarkable`. When `--cache-dir` differs from rclone's normal interactive default, rmapi metadata is stored separately at `<cache-dir>/remarkable-metadata/<account-hash>/tree.cache`. The account hash is deterministic per host and user token and does not expose either value. Metadata refresh failures leave the last complete tree available to listings; retries use bounded exponential backoff and recreate rmapi's HTTP/API client before publishing a recovered tree. Metadata-only file moves atomically derive the new version from the cached `.rmdoc` and rewrite its embedded metadata, avoiding a remote content download. The VFS cache is a separate rclone-managed layer. Testing confirmed repeated stats, copy-out, and eight concurrent opens reused one VFS entry; unmount left valid ZIP archives and no `.materializing-*` or `.promoting-*` files.
 
-Copying a new PDF, EPUB, or valid `.rmdoc` into the mount is supported. While a PDF or EPUB is being written, VFS exposes its import filename from the local cache and does not start the remote import. After the file closes and uploads successfully, the backend invalidates its parent directory; the next listing removes the import filename and exposes the canonical `.rmdoc`. Opening an existing remote object for write, truncating it, or copying over it is rejected. With delayed VFS writeback, failures are retained by VFS and logged; scripts that must synchronously observe upload errors should use `--vfs-write-back 0s` or prefer `rclone copyto`.
+Copying a new PDF, EPUB, or valid `.rmdoc` into the mount is supported. While a PDF or EPUB is being written, VFS exposes its import filename from the local cache and does not start the remote import. After the file closes and uploads successfully, the backend invalidates its parent directory; the next listing removes the import filename and exposes the canonical `.rmdoc`. Opening an existing remote object for write, truncating it, or copying over it is rejected. With delayed VFS writeback, failures are retained by VFS and logged; scripts that must synchronously observe upload errors should prefer `rclone copyto` over writing into the mount.
+
+A zero-byte destination is reported as rclone's "can't upload empty files" condition rather than as a corrupt document, because no document format is valid at zero bytes and the usual source of one is an application creating a placeholder it fills in later. VFS logs that writeback and drops it instead of failing the application's close.
+
+### Writeback delay
+
+`--vfs-write-back 0s` makes VFS upload inside the closing write handle, with exactly one attempt and no queue. That breaks the download-then-rename pattern browsers and many editors use:
+
+1. The payload is written to a temporary name — `script.pdf.crdownload` — and closed. The import is refused, correctly, because that name is not an importable document.
+2. The final name `script.pdf` is created empty and closed.
+3. The temporary file is renamed over the final name.
+
+A VFS rename only relabels the dirty cache item; it does not by itself start an upload. With synchronous writeback the payload was already offered under the temporary name, so it is never offered again, and the document silently stays in the local cache until something reopens and closes it — which is why moving the file out of the mount and back in appears to fix it.
+
+With a non-zero delay the same sequence works, because the dirty item is still queued when the rename arrives: the rename relabels the queued item to `script.pdf` and removes the queue entry for the empty placeholder, so the only import attempted is the renamed payload under its correct name. Keep `--vfs-write-back` at rclone's default or any non-zero value for interactive mounts.
 
 The import filename is a virtual VFS entry, which VFS only drops while the file is not in use and only when it re-reads the directory. A listing that lands while the entry is still held both keeps it and consumes the pending invalidation, which would otherwise leave the import filename beside the canonical `.rmdoc` until `--dir-cache-time` expires. The backend therefore repeats the invalidation on a decaying schedule out to 30 seconds; each repeat only marks one directory stale. A refused import is the other way the import filename persists, because rclone's VFS retries a rejected writeback indefinitely with no way for a backend to withdraw it — hence the idempotent-import handling described under [Document creation](#document-creation).
 
@@ -308,7 +322,7 @@ Importing `nixosModules.default` adds the custom package to `system.fsPackages`.
 							"config=/etc/rclone-remarkable.conf"
 							"cache_dir=/var/cache/rclone/remarkable"
 							"vfs_cache_mode=full"
-							"vfs_write_back=0s"
+							"vfs_write_back=5s"
 							"dir_cache_time=30s"
 							"poll_interval=30s"
 							"attr_timeout=1s"

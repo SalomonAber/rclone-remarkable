@@ -122,6 +122,118 @@ func TestPutRejectsInvalidNativeDocumentsBeforeUpload(t *testing.T) {
 	}
 }
 
+// An empty destination is the placeholder an application creates before it
+// renames its own temporary file over it, so it must not be reported as a
+// corrupt document: rclone's empty-file sentinel lets VFS drop the writeback
+// without failing the application's close.
+func TestPutReportsEmptySourceAsUnuploadable(t *testing.T) {
+	for _, remote := range []string{"Empty.pdf", "Empty.epub", "Empty.rmdoc"} {
+		t.Run(remote, func(t *testing.T) {
+			ctx := context.Background()
+			client := &fakeClient{items: map[string]Item{}}
+			backend, err := newFs(ctx, "test", "", client, t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			src := object.NewStaticObjectInfo(remote, time.Now(), 0, true, nil, backend)
+			uploaded, err := backend.Put(ctx, bytes.NewReader(nil), src)
+			if uploaded != nil || !errors.Is(err, fs.ErrorCantUploadEmptyFiles) {
+				t.Fatalf("Put = (%v, %v), want fs.ErrorCantUploadEmptyFiles", uploaded, err)
+			}
+			if fserrors.IsNoRetryError(err) {
+				t.Fatalf("Put error = %v, want it left retryable for VFS to recognize", err)
+			}
+			if len(client.uploads) != 0 {
+				t.Fatalf("empty import reached client: %#v", client.uploads)
+			}
+			assertUploadTempEmpty(t, backend.uploadTempDir)
+		})
+	}
+}
+
+// How a browser saves a download: the payload is written to a temporary name,
+// the final name is created empty, and the temporary file is then renamed over
+// it. Only the rename produces an importable name, so the import must happen
+// after it. That requires a non-zero writeback delay, which keeps the dirty
+// cache item on the writeback queue long enough for the rename to relabel it;
+// with synchronous writeback the payload is offered under the temporary name,
+// refused, and never offered again.
+func TestVFSBrowserDownloadImportsAfterRename(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := &fakeClient{items: map[string]Item{
+		"work": {ID: "work", Name: "Work", Kind: ItemDirectory},
+	}}
+	backend, err := newFs(ctx, "vfs-browser-download", "", client, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	oldCacheDir := config.GetCacheDir()
+	if err := config.SetCacheDir(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := config.SetCacheDir(oldCacheDir); err != nil {
+			t.Errorf("restore cache directory: %v", err)
+		}
+	})
+
+	options := vfscommon.Opt
+	options.CacheMode = vfscommon.CacheModeFull
+	options.WriteBack = fs.Duration(100 * time.Millisecond)
+	options.PollInterval = 0
+	mounted := vfs.New(ctx, backend, &options)
+	t.Cleanup(func() {
+		mounted.WaitForWriters(5 * time.Second)
+		if err := mounted.CleanUp(); err != nil {
+			t.Errorf("clean up VFS: %v", err)
+		}
+		mounted.Shutdown()
+	})
+
+	content := validPDF()
+	download, err := mounted.OpenFile("Work/script.pdf.crdownload", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := download.Write(content); err != nil {
+		t.Fatal(err)
+	}
+	if err := download.Close(); err != nil {
+		t.Fatalf("close download: %v", err)
+	}
+
+	placeholder, err := mounted.OpenFile("Work/script.pdf", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := placeholder.Close(); err != nil {
+		t.Fatalf("close placeholder: %v", err)
+	}
+	if err := mounted.Rename("Work/script.pdf.crdownload", "Work/script.pdf"); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		client.mu.Lock()
+		uploads := append([]uploadCall(nil), client.uploads...)
+		client.mu.Unlock()
+		if len(uploads) == 1 {
+			if filepath.Base(uploads[0].SourcePath) != "script.pdf.pdf" {
+				t.Fatalf("upload calls = %#v", uploads)
+			}
+			break
+		}
+		if len(uploads) > 1 || time.Now().After(deadline) {
+			t.Fatalf("upload calls = %#v, want exactly the renamed import", uploads)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	assertVFSNames(t, mounted, "Work", "script.pdf.rmdoc")
+}
+
 func TestNativeImportChecksCanonicalRMDOCNameForCollision(t *testing.T) {
 	ctx := context.Background()
 	client := &fakeClient{items: map[string]Item{

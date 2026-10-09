@@ -411,6 +411,12 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, _ ...fs.O
 		staged, err = stageNativeDocument(ctx, in, f.uploadTempDir, visibleName, extension)
 	}
 	if err != nil {
+		if errors.Is(err, fs.ErrorCantUploadEmptyFiles) {
+			// Left unmarked rather than wrapped as NoRetry: VFS matches this
+			// sentinel itself and abandons the writeback without failing the
+			// application's close.
+			return nil, err
+		}
 		if errors.Is(err, errInvalidRMDOC) || errors.Is(err, errInvalidImport) {
 			return nil, fserrors.NoRetryError(err)
 		}
