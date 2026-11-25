@@ -35,6 +35,10 @@ func init() {
 			Name: "host",
 			Help: "rmfakecloud or reMarkable API base URL. Defaults to RMAPI_HOST or http://127.0.0.1:7632.",
 		}, {
+			Name:    "source_view",
+			Help:    "List PDF and EPUB documents as their original file instead of as .rmdoc.\n\nAn imported Report.pdf is listed, read, and updated as Report.pdf, with the\nsize, modification time, and MD5 of the PDF itself, so rclone sync can mirror\na directory of PDFs and EPUBs. Notebooks and other documents keep the .rmdoc\nview.",
+			Default: false,
+		}, {
 			Name:     "refresh_interval",
 			Help:     "Fallback interval between rmapi metadata refreshes while listing.",
 			Default:  fs.Duration(30 * time.Second),
@@ -70,6 +74,7 @@ func init() {
 // Options configures the rmapi library client.
 type Options struct {
 	Host            string      `config:"host"`
+	SourceView      bool        `config:"source_view"`
 	RefreshInterval fs.Duration `config:"refresh_interval"`
 	Config          string      `config:"config"`
 	ClientCert      string      `config:"client_cert"`
@@ -86,6 +91,7 @@ type Fs struct {
 	root          string
 	rootID        string
 	rootMissing   bool
+	sourceView    bool
 	rootMu        sync.Mutex
 	features      *fs.Features
 	client        Client
@@ -117,7 +123,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if err != nil {
 		return nil, err
 	}
-	return newFs(ctx, name, root, client, filepath.Join(rcloneCacheDir, "remarkable"))
+	return newFsView(ctx, name, root, client, filepath.Join(rcloneCacheDir, "remarkable"), opt.SourceView)
 }
 
 func rmapiMetadataCacheRoot(rcloneCacheDir string) string {
@@ -149,11 +155,19 @@ func normalizeConnectionHost(host, root string) (string, string) {
 }
 
 func newFs(ctx context.Context, name, root string, client Client, cacheDir string) (*Fs, error) {
+	return newFsView(ctx, name, root, client, cacheDir, false)
+}
+
+func newFsView(ctx context.Context, name, root string, client Client, cacheDir string, sourceView bool) (*Fs, error) {
 	f := &Fs{
 		name:          name,
 		root:          strings.Trim(root, "/"),
+		sourceView:    sourceView,
 		client:        client,
 		uploadTempDir: filepath.Join(cacheDir, ".uploads"),
+	}
+	if sourceView {
+		fs.Debugf(f, "Listing PDF and EPUB documents by their payload (source_view)")
 	}
 	var rootErr error
 	if client != nil {
@@ -184,12 +198,29 @@ func newFs(ctx context.Context, name, root string, client Client, cacheDir strin
 	return f, rootErr
 }
 
-func (f *Fs) Name() string             { return f.name }
-func (f *Fs) Root() string             { return f.root }
-func (f *Fs) String() string           { return fmt.Sprintf("reMarkable root %q", f.root) }
-func (f *Fs) Precision() time.Duration { return time.Millisecond }
-func (f *Fs) Hashes() hash.Set         { return hash.Set(hash.None) }
-func (f *Fs) Features() *fs.Features   { return f.features }
+func (f *Fs) Name() string           { return f.name }
+func (f *Fs) Root() string           { return f.root }
+func (f *Fs) String() string         { return fmt.Sprintf("reMarkable root %q", f.root) }
+func (f *Fs) Features() *fs.Features { return f.features }
+
+// Precision is a whole second in source_view. reMarkable metadata records
+// lastModified in milliseconds, but rmapi truncates it to seconds when it
+// builds a document, so that is all a listing can report.
+func (f *Fs) Precision() time.Duration {
+	if f.sourceView {
+		return time.Second
+	}
+	return time.Millisecond
+}
+
+// Hashes is MD5 in source_view, where an object is the PDF or EPUB payload
+// rather than an archive synthesized on download.
+func (f *Fs) Hashes() hash.Set {
+	if f.sourceView {
+		return hash.Set(hash.MD5)
+	}
+	return hash.Set(hash.None)
+}
 
 // ChangeNotify polls rmapi for remote metadata changes and invalidates every
 // known directory in the mounted tree when its sync root changes. rmapi does
@@ -345,13 +376,15 @@ func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := checkDuplicateNames(items); err != nil {
+	names, err := f.listedNames(ctx, items, "")
+	if err != nil {
 		return nil, err
 	}
 
 	entries := make(fs.DirEntries, 0, len(items))
-	for _, item := range items {
-		remote := path.Join(dir, localName(item))
+	payloads := 0
+	for i, item := range items {
+		remote := path.Join(dir, names[i])
 		if item.Kind == ItemDirectory {
 			entries = append(entries, fs.NewDir(remote, item.ModTime).SetID(item.ID))
 			continue
@@ -360,9 +393,16 @@ func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
 		if err != nil {
 			return nil, err
 		}
+		if object.payloadView() {
+			payloads++
+		}
 		entries = append(entries, object)
 	}
-	fs.Debugf(f, "Listed %d entries in %q (UUID %q)", len(entries), dir, directory.ID)
+	if f.sourceView {
+		fs.Debugf(f, "Listed %d entries in %q (UUID %q), %d of them by their PDF or EPUB payload", len(entries), dir, directory.ID, payloads)
+	} else {
+		fs.Debugf(f, "Listed %d entries in %q (UUID %q)", len(entries), dir, directory.ID)
+	}
 	return entries, nil
 }
 
@@ -397,9 +437,21 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, _ ...fs.O
 	if err != nil {
 		return nil, fserrors.NoRetryError(err)
 	}
+	// fileType is the payload a PDF or EPUB import publishes. source_view
+	// lists that payload under the source name itself, so the name is kept
+	// verbatim, including the case of its extension, or the next sync would
+	// not recognize it.
+	fileType := ""
+	if extension != "rmdoc" {
+		fileType = extension
+	}
+	payloadView := f.sourceView && fileType != ""
+	if payloadView {
+		canonicalRemote = src.Remote()
+	}
 	fs.Debugf(f, "Importing %s source %q as %q", extension, src.Remote(), canonicalRemote)
-	parentID, visibleName, conflict, destErr := f.resolveDestination(ctx, canonicalRemote, ItemDocument, "")
-	if destErr != nil && !errors.Is(destErr, errDestinationExists) {
+	parentID, visibleName, conflict, destErr := f.resolveDestination(ctx, canonicalRemote, ItemDocument, "", fileType)
+	if destErr != nil && (!errors.Is(destErr, errDestinationExists) || conflict.ID == "") {
 		return nil, destErr
 	}
 	var staged stagedDocument
@@ -424,8 +476,17 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, _ ...fs.O
 	}
 	defer removeStagedDocument(staged.filePath)
 	fs.Debugf(f, "Staged %s source of %q (%d bytes, embedded UUID %q)", extension, canonicalRemote, staged.size, staged.documentID)
+	if f.sourceView && extension == "rmdoc" {
+		payload, err := archivePayload(staged.filePath, staged.documentID)
+		if err != nil {
+			return nil, fserrors.NoRetryError(fmt.Errorf("%w: %v", errInvalidRMDOC, err))
+		}
+		if payloadNamed(visibleName, payload.fileType) {
+			return nil, fserrors.NoRetryError(fmt.Errorf("%w: %q carries a %s payload, so source_view would list it as %q; copy the %s itself instead", errInvalidImport, canonicalRemote, payload.fileType, visibleName, payload.fileType))
+		}
+	}
 	if destErr != nil {
-		return f.adoptRepeatedImport(ctx, canonicalRemote, extension, staged, conflict, destErr)
+		return f.adoptRepeatedImport(ctx, canonicalRemote, extension, staged, conflict, destErr, src)
 	}
 	if staged.documentID != "" {
 		if existing, getErr := f.client.Get(ctx, staged.documentID); getErr == nil {
@@ -454,6 +515,9 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, _ ...fs.O
 	item.Name = visibleName
 	item.ParentID = parentID
 	fs.Debugf(f, "Imported %q as UUID %q version %d", canonicalRemote, item.ID, item.Version)
+	if payloadView {
+		return f.payloadObject(ctx, canonicalRemote, item, fileType, staged, src)
+	}
 	if extension != "rmdoc" {
 		// The VFS wrote the import-only source name (for example Report.pdf),
 		// while listings expose Report.pdf.rmdoc. Mark its parent stale until
@@ -471,9 +535,9 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, _ ...fs.O
 // re-sends a document that is already on the tablet. Refusing that outright
 // also wedges a mount: VFS retries the rejected writeback forever and leaves
 // the source name visible next to the .rmdoc. An identical repeat is therefore
-// reported as already done. A different payload is still refused, because
-// replacing a published document is not supported.
-func (f *Fs) adoptRepeatedImport(ctx context.Context, canonicalRemote, extension string, staged stagedDocument, conflict Item, destErr error) (fs.Object, error) {
+// reported as already done. A different payload is still refused: Put only
+// creates documents, and replacing one is Update's job in source_view.
+func (f *Fs) adoptRepeatedImport(ctx context.Context, canonicalRemote, extension string, staged stagedDocument, conflict Item, destErr error, src fs.ObjectInfo) (fs.Object, error) {
 	if conflict.Kind != ItemDocument {
 		fs.Debugf(f, "Refusing the import of %q: collection UUID %q occupies that name", canonicalRemote, conflict.ID)
 		return nil, fserrors.NoRetryError(destErr)
@@ -492,6 +556,9 @@ func (f *Fs) adoptRepeatedImport(ctx context.Context, canonicalRemote, extension
 		return nil, fserrors.NoRetryError(destErr)
 	}
 	fs.Infof(f, "%q is already published as UUID %q; skipping the duplicate upload", canonicalRemote, conflict.ID)
+	if f.sourceView && extension != "rmdoc" {
+		return f.payloadObject(ctx, canonicalRemote, conflict, extension, staged, src)
+	}
 	if extension != "rmdoc" {
 		f.notifyNativeImport(canonicalRemote)
 	}
@@ -499,6 +566,61 @@ func (f *Fs) adoptRepeatedImport(ctx context.Context, canonicalRemote, extension
 	// published .rmdoc is not the source, so a known size here would trip
 	// rclone's post-transfer size check.
 	return &Object{fs: f, remote: canonicalRemote, item: conflict, size: -1}, nil
+}
+
+// payloadObject returns the source_view object for a published PDF or EPUB
+// import. That object is the payload rmapi stores verbatim, so its size and
+// MD5 are the staged source's. rmapi stamps a new document with the upload
+// time, so the source's modification time is recorded in its place, or the
+// next sync would find the two different.
+func (f *Fs) payloadObject(ctx context.Context, remote string, item Item, fileType string, staged stagedDocument, src fs.ObjectInfo) (fs.Object, error) {
+	item, err := f.setModTime(ctx, item, src.ModTime(ctx))
+	if err != nil {
+		return nil, err
+	}
+	return &Object{
+		fs:      f,
+		remote:  remote,
+		item:    item,
+		size:    staged.size,
+		payload: payloadInfo{fileType: fileType, size: staged.size},
+		md5:     staged.md5,
+	}, nil
+}
+
+// setModTime records modTime as a document's modification time, unless it
+// already matches at the second precision rmapi reports, and moves its cached
+// archive to the new version.
+func (f *Fs) setModTime(ctx context.Context, item Item, modTime time.Time) (Item, error) {
+	if item.ModTime.Unix() == modTime.Unix() {
+		fs.Debugf(f, "UUID %q already has modification time %s", item.ID, item.ModTime.UTC().Format(time.RFC3339))
+		return item, nil
+	}
+	fs.Debugf(f, "Recording modification time %s on UUID %q (was %s)", modTime.UTC().Format(time.RFC3339Nano), item.ID, item.ModTime.UTC().Format(time.RFC3339))
+	updated, err := f.client.SetModTime(ctx, item.ID, modTime)
+	if errors.Is(err, errDocumentUpdateUnsupported) {
+		return Item{}, fserrors.NoRetryError(err)
+	}
+	if err != nil {
+		return Item{}, fmt.Errorf("set modification time of UUID %q: %w", item.ID, err)
+	}
+	f.promoteCachedArchive(item, updated, "", "")
+	return updated, nil
+}
+
+// promoteCachedArchive derives the cached archive of an updated document from
+// its previous one, optionally with a replaced payload entry. rmapi
+// increments the version by exactly one per update, so any other gap means
+// someone else changed the document in between, possibly its annotations,
+// and the new version is downloaded when it is next read instead.
+func (f *Fs) promoteCachedArchive(oldItem, newItem Item, payloadName, payloadPath string) {
+	if newItem.Version != oldItem.Version+1 {
+		fs.Debugf(f, "Not promoting the cached archive of UUID %q from version %d to %d", newItem.ID, oldItem.Version, newItem.Version)
+		return
+	}
+	if _, _, err := f.cache.promote(oldItem, newItem, payloadName, payloadPath); err != nil {
+		fs.Errorf(f, "Failed to promote the cached archive of UUID %q: %v", newItem.ID, err)
+	}
 }
 
 // importMatchesDocument reports whether a published document is the same
@@ -573,7 +695,7 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 	if err := f.ensureRoot(ctx, true); err != nil {
 		return err
 	}
-	parentID, name, err := f.destination(ctx, dir, ItemDirectory, "")
+	parentID, name, err := f.destination(ctx, dir, ItemDirectory, "", "")
 	if errors.Is(err, errDestinationExists) {
 		item, resolveErr := f.resolve(ctx, f.rootID, dir)
 		if resolveErr == nil && item.Kind == ItemDirectory {
@@ -663,7 +785,7 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	if !ok || srcObject.fs.Name() != f.Name() {
 		return nil, fs.ErrorCantMove
 	}
-	parentID, name, err := f.destination(ctx, remote, ItemDocument, srcObject.item.ID)
+	parentID, name, err := f.destination(ctx, remote, ItemDocument, srcObject.item.ID, srcObject.payload.fileType)
 	if err != nil {
 		return nil, err
 	}
@@ -672,13 +794,20 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		return nil, err
 	}
 	fs.Debugf(f, "Moved %q to %q (UUID %q)", srcObject.remote, remote, item.ID)
-	size := srcObject.size
+	moved := &Object{fs: f, remote: remote, item: item, size: srcObject.size, payload: srcObject.payload, md5: srcObject.md5}
 	if info, promoted, err := f.cache.promoteMetadata(srcObject.item, item); err != nil {
 		fs.Errorf(srcObject, "Failed to promote cached metadata: %v", err)
 	} else if promoted {
-		size = info.Size()
+		moved.size = info.Size()
+	} else if srcObject.payloadView() {
+		moved.size = -1
 	}
-	return &Object{fs: f, remote: remote, item: item, size: size}, nil
+	if moved.payloadView() {
+		// Renaming between Report.rmdoc and Report.pdf switches source_view
+		// between the archive and its payload.
+		moved.size = moved.payload.size
+	}
+	return moved, nil
 }
 
 // DirMove moves a collection by mutating its parent/name metadata once.
@@ -700,7 +829,7 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	if item.Kind != ItemDirectory {
 		return fs.ErrorDirNotFound
 	}
-	parentID, name, err := f.destination(ctx, dstRemote, ItemDirectory, item.ID)
+	parentID, name, err := f.destination(ctx, dstRemote, ItemDirectory, item.ID, "")
 	if errors.Is(err, errDestinationExists) {
 		return fs.ErrorDirExists
 	}
@@ -719,7 +848,16 @@ func (f *Fs) newObject(ctx context.Context, remote string, item Item) (*Object, 
 	if err != nil {
 		return nil, err
 	}
-	return &Object{fs: f, remote: remote, item: item, size: info.Size()}, nil
+	object := &Object{fs: f, remote: remote, item: item, size: info.Size()}
+	if f.sourceView {
+		if object.payload, err = f.cache.payload(ctx, item); err != nil {
+			return nil, err
+		}
+		if object.payloadView() {
+			object.size = object.payload.size
+		}
+	}
+	return object, nil
 }
 
 func (f *Fs) resolve(ctx context.Context, parentID, remote string) (Item, error) {
@@ -732,12 +870,13 @@ func (f *Fs) resolve(ctx context.Context, parentID, remote string) (Item, error)
 		if err != nil {
 			return Item{}, err
 		}
-		if err := checkDuplicateNames(items); err != nil {
+		names, err := f.listedNames(ctx, items, component)
+		if err != nil {
 			return Item{}, err
 		}
 		found := false
-		for _, item := range items {
-			if localName(item) == component {
+		for i, item := range items {
+			if names[i] == component {
 				current = item
 				found = true
 				break
@@ -757,6 +896,63 @@ func localName(item Item) string {
 	return item.Name
 }
 
+// sourceViewName is the name source_view lists an item under. A document
+// whose payload is a PDF or EPUB, and whose visible name ends in that
+// extension as every import's does, is listed under its visible name. Every
+// other item keeps its .rmdoc view name.
+func sourceViewName(item Item, fileType string) string {
+	if item.Kind == ItemDocument && payloadNamed(item.Name, fileType) {
+		return item.Name
+	}
+	return localName(item)
+}
+
+// payloadNamed reports whether a visible name carries the extension of a
+// PDF or EPUB payload, ignoring case, in front of a non-empty base name.
+func payloadNamed(name, fileType string) bool {
+	suffix := "." + fileType
+	return fileType != "" && len(name) > len(suffix) && strings.EqualFold(name[len(name)-len(suffix):], suffix)
+}
+
+// listedNames returns the name each item is listed under and rejects
+// siblings that would be listed under the same name. In source_view a
+// document's name depends on its payload, which is only known once its
+// archive is materialized. A document can only be listed under its visible
+// name or that name plus .rmdoc, so when match is set, documents that cannot
+// be listed as match are left unnamed rather than materialized.
+func (f *Fs) listedNames(ctx context.Context, items []Item, match string) ([]string, error) {
+	names := make([]string, len(items))
+	if !f.sourceView {
+		if err := checkDuplicateNames(items); err != nil {
+			return nil, err
+		}
+		for i, item := range items {
+			names[i] = localName(item)
+		}
+		return names, nil
+	}
+	seen := make(map[string]string, len(items))
+	for i, item := range items {
+		name := item.Name
+		if item.Kind == ItemDocument {
+			if match != "" && item.Name != match && localName(item) != match {
+				continue
+			}
+			payload, err := f.cache.payload(ctx, item)
+			if err != nil {
+				return nil, err
+			}
+			name = sourceViewName(item, payload.fileType)
+		}
+		if id, ok := seen[name]; ok {
+			return nil, fmt.Errorf("duplicate visible name %q for UUIDs %q and %q", name, id, item.ID)
+		}
+		seen[name] = item.ID
+		names[i] = name
+	}
+	return names, nil
+}
+
 func checkDuplicateNames(items []Item) error {
 	seen := make(map[string]string, len(items))
 	for _, item := range items {
@@ -769,8 +965,11 @@ func checkDuplicateNames(items []Item) error {
 	return nil
 }
 
-func (f *Fs) destination(ctx context.Context, remote string, kind ItemKind, sourceID string) (parentID, name string, err error) {
-	parentID, name, _, err = f.resolveDestination(ctx, remote, kind, sourceID)
+// destination resolves a destination path. fileType is the PDF or EPUB
+// payload of the document being placed there, if it has one; source_view
+// names such a document by its payload.
+func (f *Fs) destination(ctx context.Context, remote string, kind ItemKind, sourceID, fileType string) (parentID, name string, err error) {
+	parentID, name, _, err = f.resolveDestination(ctx, remote, kind, sourceID, fileType)
 	return parentID, name, err
 }
 
@@ -778,7 +977,7 @@ func (f *Fs) destination(ctx context.Context, remote string, kind ItemKind, sour
 // is returned, also reports the item occupying it along with the resolved parent
 // and visible name. An import needs those to tell a repeat of a document it
 // already published from a genuine collision with an unrelated one.
-func (f *Fs) resolveDestination(ctx context.Context, remote string, kind ItemKind, sourceID string) (parentID, name string, conflict Item, err error) {
+func (f *Fs) resolveDestination(ctx context.Context, remote string, kind ItemKind, sourceID, fileType string) (parentID, name string, conflict Item, err error) {
 	remote = strings.Trim(remote, "/")
 	name = path.Base(remote)
 	parentRemote := path.Dir(remote)
@@ -788,13 +987,10 @@ func (f *Fs) resolveDestination(ctx context.Context, remote string, kind ItemKin
 	if name == "." || name == "" {
 		return "", "", Item{}, fmt.Errorf("invalid destination %q", remote)
 	}
+	wanted := name
 	if kind == ItemDocument {
-		if !strings.HasSuffix(name, ".rmdoc") {
-			return "", "", Item{}, fmt.Errorf("document destination %q must end in .rmdoc", remote)
-		}
-		name = strings.TrimSuffix(name, ".rmdoc")
-		if name == "" {
-			return "", "", Item{}, fmt.Errorf("document visible name must not be empty")
+		if name, err = f.documentVisibleName(remote, name, fileType); err != nil {
+			return "", "", Item{}, err
 		}
 	}
 	parent, err := f.resolve(ctx, f.rootID, parentRemote)
@@ -811,19 +1007,54 @@ func (f *Fs) resolveDestination(ctx context.Context, remote string, kind ItemKin
 	if err != nil {
 		return "", "", Item{}, err
 	}
-	if err := checkDuplicateNames(items); err != nil {
+	names, err := f.listedNames(ctx, items, wanted)
+	if err != nil {
 		return "", "", Item{}, err
 	}
-	wanted := name
-	if kind == ItemDocument {
-		wanted += ".rmdoc"
-	}
-	for _, item := range items {
-		if localName(item) == wanted && item.ID != sourceID {
+	for i, item := range items {
+		if names[i] == wanted && item.ID != sourceID {
 			return parent.ID, name, item, fmt.Errorf("%w: %q", errDestinationExists, remote)
 		}
 	}
+	if f.sourceView {
+		// Names that are distinct here can still coincide in the .rmdoc view,
+		// for example a Report.pdf notebook next to an imported Report.pdf.
+		// A remote without source_view, such as a mount of the same account,
+		// would refuse to list that directory, so do not create it.
+		rmdocName := localName(Item{Name: name, Kind: kind})
+		for _, item := range items {
+			if localName(item) == rmdocName && item.ID != sourceID {
+				fs.Debugf(f, "Refusing %q: UUID %q already has the .rmdoc view name %q", remote, item.ID, rmdocName)
+				return "", "", Item{}, fserrors.NoRetryError(fmt.Errorf("%w: %q would share the .rmdoc view name %q with UUID %q", errDestinationExists, remote, rmdocName, item.ID))
+			}
+		}
+	}
 	return parent.ID, name, Item{}, nil
+}
+
+// documentVisibleName maps the local name of a document destination to the
+// reMarkable visible name. In source_view a document with a PDF or EPUB
+// payload may also be named by that payload, in which case the local name is
+// the visible name; any other local name must end in .rmdoc and must not turn
+// into one that source_view lists differently.
+func (f *Fs) documentVisibleName(remote, local, fileType string) (string, error) {
+	if f.sourceView && payloadNamed(local, fileType) {
+		return local, nil
+	}
+	if !strings.HasSuffix(local, ".rmdoc") {
+		if f.sourceView && fileType != "" {
+			return "", fmt.Errorf("document destination %q must end in .%s or .rmdoc", remote, fileType)
+		}
+		return "", fmt.Errorf("document destination %q must end in .rmdoc", remote)
+	}
+	name := strings.TrimSuffix(local, ".rmdoc")
+	if name == "" {
+		return "", fmt.Errorf("document visible name must not be empty")
+	}
+	if f.sourceView && payloadNamed(name, fileType) {
+		return "", fmt.Errorf("document destination %q would be listed as %q, because its payload is a %s", remote, name, fileType)
+	}
+	return name, nil
 }
 
 var (

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 
 	rmarchive "github.com/juruen/rmapi/archive"
 	"github.com/rclone/rclone/fs"
@@ -20,10 +21,16 @@ var materializations singleflight.Group
 type contentCache struct {
 	dir    string
 	client Client
+
+	// Both are keyed by archive cache path, so a new document version is
+	// examined afresh.
+	mu       sync.Mutex
+	payloads map[string]payloadInfo
+	hashes   map[string]string
 }
 
 func newContentCache(dir string, client Client) *contentCache {
-	return &contentCache{dir: dir, client: client}
+	return &contentCache{dir: dir, client: client, payloads: make(map[string]payloadInfo), hashes: make(map[string]string)}
 }
 
 // String identifies the cache in log messages; it has no Fs to borrow a name from.
@@ -98,6 +105,13 @@ func (c *contentCache) materialize(ctx context.Context, item Item) (string, os.F
 }
 
 func (c *contentCache) promoteMetadata(oldItem, newItem Item) (os.FileInfo, bool, error) {
+	return c.promote(oldItem, newItem, "", "")
+}
+
+// promote derives the cached archive of newItem from that of oldItem, so a
+// metadata change or a payload this process uploaded itself costs no
+// download. When payloadName is set, that entry is replaced by payloadPath.
+func (c *contentCache) promote(oldItem, newItem Item, payloadName, payloadPath string) (os.FileInfo, bool, error) {
 	oldPath, err := c.path(oldItem)
 	if err != nil {
 		return nil, false, err
@@ -120,7 +134,7 @@ func (c *contentCache) promoteMetadata(oldItem, newItem Item) (os.FileInfo, bool
 	}
 
 	value, err, _ := materializations.Do(newPath, func() (any, error) {
-		return rewriteRMDOCMetadata(oldPath, newPath, newItem)
+		return rewriteRMDOCMetadata(oldPath, newPath, newItem, payloadName, payloadPath)
 	})
 	if err != nil {
 		return nil, false, err
@@ -129,7 +143,10 @@ func (c *contentCache) promoteMetadata(oldItem, newItem Item) (os.FileInfo, bool
 	return value.(os.FileInfo), true, nil
 }
 
-func rewriteRMDOCMetadata(oldPath, newPath string, item Item) (os.FileInfo, error) {
+// rewriteRMDOCMetadata copies the archive at oldPath to newPath with its
+// metadata rewritten for item and, when payloadName is set, that entry's
+// content replaced by the file at payloadPath.
+func rewriteRMDOCMetadata(oldPath, newPath string, item Item, payloadName, payloadPath string) (os.FileInfo, error) {
 	source, err := zip.OpenReader(oldPath)
 	if err != nil {
 		return nil, err
@@ -150,6 +167,7 @@ func rewriteRMDOCMetadata(oldPath, newPath string, item Item) (os.FileInfo, erro
 	}()
 
 	writer := zip.NewWriter(tmp)
+	replaced := false
 	for _, entry := range source.File {
 		header := entry.FileHeader
 		dst, err := writer.CreateHeader(&header)
@@ -173,6 +191,9 @@ func rewriteRMDOCMetadata(oldPath, newPath string, item Item) (os.FileInfo, erro
 				metadata.LastModified = strconv.FormatInt(item.ModTime.UnixMilli(), 10)
 			}
 			err = json.NewEncoder(dst).Encode(metadata)
+		} else if payloadName != "" && entry.Name == payloadName {
+			err = copyFileTo(dst, payloadPath)
+			replaced = true
 		} else {
 			_, err = io.Copy(dst, src)
 		}
@@ -183,6 +204,9 @@ func rewriteRMDOCMetadata(oldPath, newPath string, item Item) (os.FileInfo, erro
 		if closeErr != nil {
 			return nil, closeErr
 		}
+	}
+	if payloadName != "" && !replaced {
+		return nil, fmt.Errorf("cached archive has no %s entry to replace", payloadName)
 	}
 	if err := writer.Close(); err != nil {
 		return nil, err
@@ -198,4 +222,67 @@ func rewriteRMDOCMetadata(oldPath, newPath string, item Item) (os.FileInfo, erro
 	}
 	committed = true
 	return os.Stat(newPath)
+}
+
+// payload reports the PDF or EPUB a document was imported from. The format is
+// the fileType recorded in the document's .content. rmapi parses that field
+// while mirroring but neither exposes it nor fills it in for documents it
+// uploaded itself, so it is read from the materialized archive instead.
+func (c *contentCache) payload(ctx context.Context, item Item) (payloadInfo, error) {
+	cachePath, _, err := c.materialize(ctx, item)
+	if err != nil {
+		return payloadInfo{}, err
+	}
+	c.mu.Lock()
+	info, ok := c.payloads[cachePath]
+	c.mu.Unlock()
+	if ok {
+		return info, nil
+	}
+	info, err = archivePayload(cachePath, item.ID)
+	if err != nil {
+		return payloadInfo{}, fmt.Errorf("document %q: %w", item.ID, err)
+	}
+	if info.fileType == "" {
+		fs.Debugf(c, "Document %q version %d has no single PDF or EPUB payload", item.ID, item.Version)
+	} else {
+		fs.Debugf(c, "Document %q version %d carries a %s payload (%d bytes)", item.ID, item.Version, info.fileType, info.size)
+	}
+	c.mu.Lock()
+	c.payloads[cachePath] = info
+	c.mu.Unlock()
+	return info, nil
+}
+
+// payloadMD5 returns the hex MD5 of a document's PDF or EPUB payload.
+func (c *contentCache) payloadMD5(ctx context.Context, item Item, fileType string) (string, error) {
+	cachePath, _, err := c.materialize(ctx, item)
+	if err != nil {
+		return "", err
+	}
+	c.mu.Lock()
+	sum, ok := c.hashes[cachePath]
+	c.mu.Unlock()
+	if ok {
+		return sum, nil
+	}
+	sum, err = archiveEntryMD5(cachePath, payloadEntryName(item.ID, fileType))
+	if err != nil {
+		return "", err
+	}
+	fs.Debugf(c, "Hashed the %s payload of document %q version %d", fileType, item.ID, item.Version)
+	c.mu.Lock()
+	c.hashes[cachePath] = sum
+	c.mu.Unlock()
+	return sum, nil
+}
+
+func copyFileTo(dst io.Writer, filePath string) error {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	_, err = io.Copy(dst, file)
+	return err
 }
