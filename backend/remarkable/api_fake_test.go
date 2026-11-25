@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -26,6 +27,8 @@ type fakeClient struct {
 	downloads       map[string]int
 	uploads         []uploadCall
 	uploadErrors    []error
+	replaces        []replaceCall
+	modTimes        []modTimeCall
 	moves           []moveCall
 	mkdirs          []mkdirCall
 	removes         []string
@@ -47,6 +50,17 @@ type moveCall struct {
 type uploadCall struct {
 	ParentID   string
 	SourcePath string
+}
+
+type replaceCall struct {
+	ID      string
+	Payload []byte
+	ModTime time.Time
+}
+
+type modTimeCall struct {
+	ID      string
+	ModTime time.Time
 }
 
 type mkdirCall struct {
@@ -204,7 +218,9 @@ func fakeRMDOC(documentID, payloadName string, payload []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := content.Write([]byte(`{}`)); err != nil {
+	// rmapi records the format of an imported PDF or EPUB as fileType.
+	fileType := strings.TrimPrefix(path.Ext(payloadName), ".")
+	if _, err := fmt.Fprintf(content, `{"fileType":%q}`, fileType); err != nil {
 		return nil, err
 	}
 	if err := writer.Close(); err != nil {
@@ -244,6 +260,59 @@ func (c *fakeClient) Mkdir(_ context.Context, parentID, name string) (Item, erro
 	c.items[item.ID] = item
 	return item, nil
 }
+
+// Replace mimics rmapi's ReplaceDocumentFileAt: the payload entry with the
+// source's extension is swapped, the version is incremented, and the
+// modification time is reported at rmapi's whole-second precision.
+func (c *fakeClient) Replace(_ context.Context, id, sourcePath string, modTime time.Time) (Item, error) {
+	payload, err := os.ReadFile(sourcePath)
+	if err != nil {
+		return Item{}, err
+	}
+	extension := strings.ToLower(strings.TrimPrefix(filepath.Ext(sourcePath), "."))
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	item, ok := c.items[id]
+	if !ok {
+		return Item{}, fmt.Errorf("item %q not found", id)
+	}
+	archive, err := zip.NewReader(bytes.NewReader(c.contents[id]), int64(len(c.contents[id])))
+	if err != nil {
+		return Item{}, err
+	}
+	found := false
+	for _, entry := range archive.File {
+		found = found || entry.Name == id+"."+extension
+	}
+	if !found {
+		return Item{}, fmt.Errorf("document does not contain .%s", extension)
+	}
+	content, err := fakeRMDOC(id, id+"."+extension, payload)
+	if err != nil {
+		return Item{}, err
+	}
+	c.replaces = append(c.replaces, replaceCall{ID: id, Payload: payload, ModTime: modTime})
+	c.contents[id] = content
+	item.Version++
+	item.ModTime = modTime.Truncate(time.Second).UTC()
+	c.items[id] = item
+	return item, nil
+}
+
+func (c *fakeClient) SetModTime(_ context.Context, id string, modTime time.Time) (Item, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	item, ok := c.items[id]
+	if !ok {
+		return Item{}, fmt.Errorf("item %q not found", id)
+	}
+	c.modTimes = append(c.modTimes, modTimeCall{ID: id, ModTime: modTime})
+	item.Version++
+	item.ModTime = modTime.Truncate(time.Second).UTC()
+	c.items[id] = item
+	return item, nil
+}
+
 func (c *fakeClient) Remove(_ context.Context, id string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()

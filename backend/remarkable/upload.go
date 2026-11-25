@@ -4,6 +4,8 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
@@ -27,6 +29,7 @@ type stagedDocument struct {
 	filePath   string
 	size       int64
 	documentID string
+	md5        string
 }
 
 func stageRMDOC(ctx context.Context, in io.Reader, tempRoot, visibleName string) (filePath string, size int64, documentID string, err error) {
@@ -69,7 +72,9 @@ func stageDocument(ctx context.Context, in io.Reader, tempRoot, visibleName, ext
 	if err != nil {
 		return stagedDocument{}, err
 	}
-	staged.size, err = io.Copy(file, readers.NewContextReader(ctx, in))
+	hasher := md5.New()
+	staged.size, err = io.Copy(io.MultiWriter(file, hasher), readers.NewContextReader(ctx, in))
+	staged.md5 = hex.EncodeToString(hasher.Sum(nil))
 	if err == nil {
 		err = file.Sync()
 	}
@@ -325,4 +330,145 @@ func removeStagedDocument(filePath string) {
 	if filePath != "" {
 		_ = os.RemoveAll(filepath.Dir(filePath))
 	}
+}
+
+// payloadInfo describes the PDF or EPUB payload of a document. fileType is
+// empty for notebooks and any other document without exactly that payload.
+type payloadInfo struct {
+	fileType string
+	size     int64
+}
+
+func payloadEntryName(documentID, fileType string) string {
+	return documentID + "." + fileType
+}
+
+// archivePayload reads the payload of the document documentID from the
+// .rmdoc archive at archivePath: the fileType its .content records, provided
+// the archive carries that file as <uuid>.<fileType>.
+func archivePayload(archivePath, documentID string) (payloadInfo, error) {
+	archive, err := zip.OpenReader(archivePath)
+	if err != nil {
+		return payloadInfo{}, fmt.Errorf("open rmdoc %q: %w", archivePath, err)
+	}
+	defer archive.Close()
+
+	entries := make(map[string]*zip.File, len(archive.File))
+	for _, entry := range archive.File {
+		if !entry.FileInfo().IsDir() {
+			entries[entry.Name] = entry
+		}
+	}
+	contentEntry := entries[documentID+".content"]
+	if contentEntry == nil {
+		return payloadInfo{}, nil
+	}
+	reader, err := contentEntry.Open()
+	if err != nil {
+		return payloadInfo{}, fmt.Errorf("open %s: %w", contentEntry.Name, err)
+	}
+	defer reader.Close()
+	var content struct {
+		FileType string `json:"fileType"`
+	}
+	if err := json.NewDecoder(reader).Decode(&content); err != nil {
+		return payloadInfo{}, fmt.Errorf("read %s: %w", contentEntry.Name, err)
+	}
+	if content.FileType != "pdf" && content.FileType != "epub" {
+		return payloadInfo{}, nil
+	}
+	payload := entries[payloadEntryName(documentID, content.FileType)]
+	if payload == nil {
+		return payloadInfo{}, nil
+	}
+	return payloadInfo{fileType: content.FileType, size: int64(payload.UncompressedSize64)}, nil
+}
+
+// openArchiveEntry opens entryName inside the archive at archivePath, starting
+// offset bytes in. rmapi stores document files uncompressed, so their bytes
+// are read straight from the archive and seeking is free; a compressed entry
+// is decompressed and skipped up to offset.
+func openArchiveEntry(archivePath, entryName string, offset int64) (io.ReadCloser, error) {
+	file, err := os.Open(archivePath)
+	if err != nil {
+		return nil, err
+	}
+	reader, err := openArchiveFile(file, entryName, offset)
+	if err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	return reader, nil
+}
+
+func openArchiveFile(file *os.File, entryName string, offset int64) (io.ReadCloser, error) {
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	archive, err := zip.NewReader(file, info.Size())
+	if err != nil {
+		return nil, fmt.Errorf("open rmdoc %q: %w", file.Name(), err)
+	}
+	var entry *zip.File
+	for _, candidate := range archive.File {
+		if candidate.Name == entryName && !candidate.FileInfo().IsDir() {
+			entry = candidate
+			break
+		}
+	}
+	if entry == nil {
+		return nil, fmt.Errorf("rmdoc %q has no %s entry", file.Name(), entryName)
+	}
+	size := int64(entry.UncompressedSize64)
+	if offset < 0 || offset > size {
+		return nil, fmt.Errorf("invalid read offset %d", offset)
+	}
+	if entry.Method == zip.Store {
+		dataOffset, err := entry.DataOffset()
+		if err != nil {
+			return nil, err
+		}
+		return struct {
+			io.Reader
+			io.Closer
+		}{Reader: io.NewSectionReader(file, dataOffset+offset, size-offset), Closer: file}, nil
+	}
+	entryReader, err := entry.Open()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := io.CopyN(io.Discard, entryReader, offset); err != nil {
+		_ = entryReader.Close()
+		return nil, err
+	}
+	return struct {
+		io.Reader
+		io.Closer
+	}{Reader: entryReader, Closer: closers{entryReader, file}}, nil
+}
+
+type closers []io.Closer
+
+func (c closers) Close() error {
+	var err error
+	for _, closer := range c {
+		if closeErr := closer.Close(); err == nil {
+			err = closeErr
+		}
+	}
+	return err
+}
+
+func archiveEntryMD5(archivePath, entryName string) (string, error) {
+	reader, err := openArchiveEntry(archivePath, entryName, 0)
+	if err != nil {
+		return "", err
+	}
+	defer reader.Close()
+	hasher := md5.New()
+	if _, err := io.Copy(hasher, reader); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), nil
 }

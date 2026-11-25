@@ -60,7 +60,24 @@ type Client interface {
 	Move(ctx context.Context, id, parentID, name string) (Item, error)
 	Mkdir(ctx context.Context, parentID, name string) (Item, error)
 	Remove(ctx context.Context, id string) error
+	// Replace swaps the PDF or EPUB payload of an existing document, keeping
+	// its UUID, and records modTime as its modification time.
+	Replace(ctx context.Context, id, sourcePath string, modTime time.Time) (Item, error)
+	// SetModTime records modTime as a document's modification time.
+	SetModTime(ctx context.Context, id string, modTime time.Time) (Item, error)
 }
+
+// documentUpdater is implemented by the SalomonAber/rmapi sync 1.5 ApiCtx.
+// rmapi's ApiCtx interface has no way to write a document's lastModified, and
+// its ReplaceDocumentFile leaves the metadata version unchanged, so every
+// version-keyed content cache, including this backend's, would keep serving
+// the replaced payload.
+type documentUpdater interface {
+	ReplaceDocumentFileAt(docId, sourceDocPath string, modified time.Time, notify bool) (*model.Document, error)
+	SetLastModified(docId string, modified time.Time, notify bool) (*model.Document, error)
+}
+
+var errDocumentUpdateUnsupported = errors.New("rmapi: this client cannot update document metadata")
 
 type rmapiClient struct {
 	mu              sync.Mutex
@@ -484,6 +501,52 @@ func (c *rmapiClient) Remove(_ context.Context, id string) error {
 	c.filetree().DeleteNode(node)
 	fs.Debugf(c, "Removed UUID %q", id)
 	return nil
+}
+
+func (c *rmapiClient) Replace(_ context.Context, id, sourcePath string, modTime time.Time) (Item, error) {
+	rmapiHostMu.Lock()
+	configureRMAPIHost(c.host)
+	defer rmapiHostMu.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	updater, ok := c.api.(documentUpdater)
+	if !ok {
+		return Item{}, errDocumentUpdateUnsupported
+	}
+	fs.Debugf(c, "Replacing the %s payload of UUID %q (modification time %s)", strings.TrimPrefix(filepath.Ext(sourcePath), "."), id, modTime.UTC().Format(time.RFC3339Nano))
+	doc, err := updater.ReplaceDocumentFileAt(id, sourcePath, modTime, true)
+	if err != nil {
+		return Item{}, err
+	}
+	return c.updatedDocument(doc)
+}
+
+func (c *rmapiClient) SetModTime(_ context.Context, id string, modTime time.Time) (Item, error) {
+	rmapiHostMu.Lock()
+	configureRMAPIHost(c.host)
+	defer rmapiHostMu.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	updater, ok := c.api.(documentUpdater)
+	if !ok {
+		return Item{}, errDocumentUpdateUnsupported
+	}
+	fs.Debugf(c, "Setting the modification time of UUID %q to %s", id, modTime.UTC().Format(time.RFC3339Nano))
+	doc, err := updater.SetLastModified(id, modTime, true)
+	if err != nil {
+		return Item{}, err
+	}
+	return c.updatedDocument(doc)
+}
+
+// updatedDocument publishes a document's new metadata to the in-memory tree,
+// as the other mutations do, so listings see it before the next refresh.
+func (c *rmapiClient) updatedDocument(doc *model.Document) (Item, error) {
+	if node := c.filetree().NodeById(doc.ID); node != nil {
+		node.Document = doc
+	}
+	fs.Debugf(c, "UUID %q is now version %d", doc.ID, doc.Version)
+	return itemFromDocument(doc)
 }
 
 func itemFromNode(node *model.Node) (Item, error) {

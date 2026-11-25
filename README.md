@@ -1,6 +1,6 @@
 # rclone-remarkable
 
-An out-of-tree rclone backend named `remarkable`. The current model exposes reMarkable collections as directories and documents as raw ZIP-compatible `.rmdoc` objects. New PDF, EPUB, and `.rmdoc` imports and metadata mutations are supported; editing or replacing an existing compound document is not.
+An out-of-tree rclone backend named `remarkable`. The current model exposes reMarkable collections as directories and documents as raw ZIP-compatible `.rmdoc` objects. New PDF, EPUB, and `.rmdoc` imports and metadata mutations are supported; editing or replacing an existing compound document is not. The opt-in [`source_view`](#mirror-mode-source_view) option instead presents imported PDFs and EPUBs as their original files, so `rclone sync` can mirror a local directory onto the tablet.
 
 ## NixOS Quick Start
 
@@ -142,13 +142,13 @@ Imports are idempotent. Because rclone cannot match an import-only source (`Repo
 
 For the same reason, an upload error is not taken at face value: rmapi can fail after the server has already committed the import, for example when its response is lost. The backend refreshes its metadata and adopts the published document if the import landed. Without that, the document would be on the tablet while every retry was refused as a duplicate destination, and a mount would retry the rejected writeback forever with the import filename still visible.
 
-The canonical readable representation is always `.rmdoc`: importing `Report.pdf` or `Book.epub` creates `Report.pdf.rmdoc` or `Book.epub.rmdoc`. Retaining the normalized source extension records provenance and allows same-basename PDF and EPUB imports to coexist. Because mounted names derive from reMarkable's visible names, the source extension is also visible on the tablet. rmapi synthesizes or normalizes the archive, so it is not byte-for-byte identical to the source and has a different size. The object returned directly from `Put` therefore reports unknown size (`-1`); a subsequent listing materializes the published representation and reports its actual size.
+Without `source_view`, the canonical readable representation is always `.rmdoc`: importing `Report.pdf` or `Book.epub` creates `Report.pdf.rmdoc` or `Book.epub.rmdoc`. Retaining the normalized source extension records provenance and allows same-basename PDF and EPUB imports to coexist. Because mounted names derive from reMarkable's visible names, the source extension is also visible on the tablet. rmapi synthesizes or normalizes the archive, so it is not byte-for-byte identical to the source and has a different size. The object returned directly from `Put` therefore reports unknown size (`-1`); a subsequent listing materializes the published representation and reports its actual size.
 
-`Object.Update` deliberately rejects replacement. rmapi's `ReplaceDocumentFile` replaces one contained PDF/EPUB-style payload and does not safely replace an entire compound `.rmdoc`, so the backend does not pretend that POSIX editing semantics exist.
+`Object.Update` deliberately rejects replacement. rmapi's `ReplaceDocumentFile` replaces one contained PDF/EPUB-style payload and does not safely replace an entire compound `.rmdoc`, so the backend does not pretend that POSIX editing semantics exist. The one exception is a PDF or EPUB listed by its payload under [`source_view`](#mirror-mode-source_view), where the object being replaced is exactly that payload.
 
 ## rmapi findings
 
-The backend temporarily uses `SalomonAber/rmapi` at commit `5bf5135049c30e35e1c5797209d42a7ffc23507a` (2026-09-01), based on `ddvk/rmapi` commit `aa60dac8a8dbb1b4eb6a25f2caf2f3daea573373`. The fork adds a caller-configurable sync metadata cache directory, preserves transport error sentinels during the initial mirror so expired user tokens can be refreshed safely, and redacts authorization headers from trace dumps. It will be replaced by upstream `ddvk/rmapi` once those APIs are available there. The module still declares `github.com/juruen/rmapi`, so `go.mod` requires that path and uses a replacement. This revision also includes ddvk's root-index canonical sorting fix and newer sync and document-format fixes.
+The backend temporarily uses `SalomonAber/rmapi` at commit `5bf5135049c30e35e1c5797209d42a7ffc23507a` (2026-09-01), based on `ddvk/rmapi` commit `aa60dac8a8dbb1b4eb6a25f2caf2f3daea573373`. The fork adds a caller-configurable sync metadata cache directory, preserves transport error sentinels during the initial mirror so expired user tokens can be refreshed safely, and redacts authorization headers from trace dumps. Its `document-modtime` branch, commit `3ea4cdc4ac37a1c35784b86f8e32658ea52817da`, adds `ApiCtx.ReplaceDocumentFileAt` and `ApiCtx.SetLastModified` for [`source_view`](#mirror-mode-source_view). `ReplaceDocumentFile` leaves the metadata version unchanged after swapping a payload, so every version-keyed cache, including this backend's and that of a mount on another host, would keep serving the old file. rmapi also has no other way to write a document's `lastModified`. The new methods are reached through a type assertion, because adding them to rmapi's `ApiCtx` interface would break that interface's other implementations. It will be replaced by upstream `ddvk/rmapi` once those APIs are available there. The module still declares `github.com/juruen/rmapi`, so `go.mod` requires that path and uses a replacement. This revision also includes ddvk's root-index canonical sorting fix and newer sync and document-format fixes.
 
 The relevant library surface is the sync 1.5 `api.ApiCtx` and its `filetree`/`model` packages:
 
@@ -159,11 +159,16 @@ The relevant library surface is the sync 1.5 `api.ApiCtx` and its `filetree`/`mo
 | parent UUID | `model.Document.Parent` |
 | item type | `CollectionType`, `DocumentType`, or `TemplateType` |
 | document version | `model.Document.Version` |
-| modification time | `model.Document.ModifiedClient`, RFC3339Nano; derived from metadata milliseconds |
+| modification time | `model.Document.ModifiedClient`, RFC3339Nano; derived from metadata `lastModified` milliseconds, truncated to whole seconds |
+| payload format | not exposed; read from `fileType` in the document's `<uuid>.content` |
+| replace payload | `ApiCtx.ReplaceDocumentFileAt(id, path, modified, notify)` (fork) swaps `<uuid>.<ext>`, sets `lastModified`, increments the version |
+| set modification time | `ApiCtx.SetLastModified(id, modified, notify)` (fork) sets `lastModified`, increments the version |
 | raw `.rmdoc` | `ApiCtx.FetchDocument(id, path)` writes the document blob set as a ZIP archive |
 | rename/move | `ApiCtx.MoveEntry(srcNode, dstDirNode, name)` performs both atomically in metadata |
 | mkdir | `ApiCtx.CreateDir(parentID, name, notify)` |
 | delete | `ApiCtx.DeleteEntry(node, recursive, notify)` removes the entry from the sync tree |
+
+rmapi parses each document's `.content` into `BlobDoc.Content` while mirroring, but `model.Document` has no `fileType`, and a document uploaded through the same `ApiCtx` never gets its `Content` filled in, because the mirror only re-reads `.content` when its hash changes. The backend therefore takes the payload format from the archive it materializes anyway.
 
 rmapi also creates a synthetic `trash` collection in its file tree. Deletion uses rmapi's normal non-recursive `DeleteEntry` operation; non-empty directories are rejected with rclone's `ErrorDirectoryNotEmpty` before that call.
 
@@ -182,6 +187,7 @@ The backend accepts these options:
 | `client_key` | PEM-encoded private key for `client_cert`. Requires `client_cert`. |
 | `device_token` | Overrides `devicetoken` from the config file. |
 | `user_token` | Overrides `usertoken` from the config file. |
+| `source_view` | List PDF and EPUB documents as their original files instead of `.rmdoc`. Default `false`. See [Mirror mode](#mirror-mode-source_view). |
 
 `usertoken` is required. This backend deliberately does not use rmapi's interactive token helper because it may terminate the process on configuration failures. Refresh an expired user token with rmapi or provide an updated YAML file/token.
 
@@ -210,14 +216,56 @@ go build -o rclone .
 ./rclone copyto :remarkable,host=http://127.0.0.1:7632:Work/Existing.rmdoc /tmp/Existing.rmdoc
 ```
 
+## Mirror mode (`source_view`)
+
+`source_view = true` turns the backend into a one-way mirror target for a local directory of PDFs and EPUBs. The command below keeps the reMarkable folder `Personal` in step with a Syncthing folder. It is idempotent, so it can run every few minutes from a systemd timer:
+
+```ini
+[remarkable-mirror]
+type = remarkable
+host = https://rmfakecloud.example.com
+config = /run/agenix/rmapi-config
+source_view = true
+```
+
+```sh
+rclone sync /var/lib/syncthing/personal remarkable-mirror:Personal --include '*.{pdf,epub}'
+```
+
+A run with no source changes transfers, deletes, and re-uploads nothing. A changed source replaces the payload of the existing document in place. A removed source removes its document. Configure the mirror as a separate remote: a mount of the same account, such as the [NixOS quick start](#nixos-quick-start), keeps the default `.rmdoc` view and is unaffected.
+
+### What the mirror lists
+
+A document whose `.content` records `fileType` `pdf` or `epub`, whose archive carries that file as `<uuid>.pdf` or `<uuid>.epub`, and whose visible name ends in that extension is listed under its visible name. Every import is named that way, so `Report.pdf` is listed as `Report.pdf`. Its size, MD5, and contents are those of the PDF itself, read from the same UUID-and-version content cache as the `.rmdoc` view. Every other document keeps its `.rmdoc` name and behaves exactly as without the option: notebooks, and also PDFs uploaded under a name without an extension, such as `Scan` (listed as `Scan.rmdoc`). Names that coincide after this mapping are rejected as ambiguous, as before. A `Report.pdf` notebook and an imported `Report.pdf` stay distinct as `Report.pdf.rmdoc` and `Report.pdf`. The mirror refuses to create such a pair, though, because a remote without `source_view` would see two `Report.pdf.rmdoc` entries and refuse to list the folder.
+
+Imports keep the source name verbatim, including the case of its extension, so `Scan.PDF` stays `Scan.PDF` and the next run still recognizes it. rclone's filters are case-sensitive, so add `--ignore-case` if the source has upper-case extensions.
+
+### Filtering and deletions
+
+Use the `--include '*.{pdf,epub}'` filter. Without it, `sync` tries to upload every other file in the source, and each upload fails as an unsupported import. With it, other source files are skipped, and remote entries the filter excludes are left alone. `rclone sync` only deletes destination files that the filter includes, unless `--delete-excluded` is given.
+
+That decides what happens to notebooks in the target folder. Notebooks and other `.rmdoc` entries have no source counterpart, so `sync` deletes them unless the filter excludes them. With the recommended filter they are excluded and kept. Without it, or with `--delete-excluded`, they are deleted. Either way, every PDF or EPUB in the target folder that has no source file is deleted, including one added on the tablet or through another client. Point the mirror at a folder that only it writes to.
+
+### Modification times
+
+Imports and replacements record the source modification time as the document's `lastModified` metadata, and listings report it back. reMarkable stores `lastModified` in milliseconds, but rmapi truncates it to whole seconds when it builds its document tree, so the backend's precision is one second. rclone compares times within that window, so a mirrored file matches its source. `SetModTime` rewrites the metadata the same way, with no payload upload. Each metadata write increments the document version. The backend derives the new version's cached archive locally instead of downloading it again.
+
+Opening or annotating a document on the tablet can change its `lastModified`. The next `sync` then finds equal size and MD5 and only puts the source time back ("Updated modification time in destination"). Nothing is uploaded and no annotation changes. The same applies with `--checksum`, which compares size and MD5 only.
+
+### Updates and annotations
+
+A changed source is written with rmapi's payload replacement. The document keeps its UUID, and with it its annotations, reading position, and tags, while its version increments. The replacement must be the same format as the published document: a PDF only replaces a PDF and an EPUB only replaces an EPUB, and the content is validated the way an import is. Updates to `.rmdoc` objects, notebooks included, are still rejected. If the payload is byte-for-byte unchanged, only the modification time is written.
+
+Annotations belong to page positions, not page content. If a new revision of a PDF inserts, removes, or reorders pages, existing annotations stay on their old page numbers and no longer line up. Update in place suits documents that change without repagination. If annotations on a reworked document matter, delete the old document and let the mirror import the new revision instead. The replacement does not rewrite `.content`, where the tablet keeps its page list and page count. How the tablet reconciles a changed page count is up to its firmware, and that has not been tested against a real device.
+
 ## Integration Test
 
-The integration suite is disabled by default. It creates uniquely named top-level folders, uploads a generated controlled `.rmdoc`, verifies list/rename/move/download/delete behavior, and removes its test folders. It never selects unrelated documents.
+The integration suite is disabled by default. It creates uniquely named top-level folders, uploads a generated controlled `.rmdoc`, verifies list/rename/move/download/delete behavior, and removes its test folders. It never selects unrelated documents. `TestRMFakecloudSourceViewSync` runs `rclone sync` with `source_view` into its own folder through the mirror scenario: import, an idle re-run with no transfers, a changed source replaced under the same UUID, and a removed source deleted while a stand-in notebook survives. It reads the results back through a freshly mirrored client.
 
 ```sh
 REMARKABLE_INTEGRATION=1 \
 RMAPI_CONFIG=/path/to/rmapi.conf \
-go test ./backend/remarkable -run TestRMFakecloudIntegration -count=1
+go test ./backend/remarkable -run TestRMFakecloud -count=1
 ```
 
 Set `REMARKABLE_HOST` to override the integration endpoint and `REMARKABLE_USER_TOKEN`/`REMARKABLE_DEVICE_TOKEN` to supply credentials without a YAML file.
@@ -270,6 +318,7 @@ Running any command with `-vv` (`--log-level DEBUG`) traces the decisions that a
 - VFS invalidation: notifier registration and shutdown, the effective poll interval, the number of directories invalidated after a remote change, and each invalidation with the number of notifiers that received it, including the repeats scheduled after a native import.
 - imports: the canonical destination name, the staged source size and embedded UUID, the published UUID, whether a name collision was recognized as an idempotent repeat or refused, and whether a failed upload was found to have landed.
 - content cache: cache hits, materializations with their resulting size, and metadata promotions after a move.
+- `source_view`: the payload format found for each document version, the number of entries per listing shown by their payload, destinations refused because they would collide in the `.rmdoc` view, modification-time writes with the old and new time (or why one was unnecessary), and each update with whether it replaced the payload, only rewrote the time, or was refused and why, plus whether the new version's cached archive was derived locally.
 
 Document names, remote paths, UUIDs, and cache paths appear in these lines; tokens and certificates never do.
 
